@@ -1,0 +1,10 @@
+Rate this NPC response:
+
+Scene: {{ scene }}
+Mood: {{ mood }}
+Player action: {{ player_action }}
+
+Response:
+{{ response }}
+
+Score (0.0-1.0):

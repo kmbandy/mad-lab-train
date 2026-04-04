@@ -1,0 +1,165 @@
+# D&D NPC Roleplay Theme
+# Used by: pipeline/generate.py, pipeline/validate.py, pipeline/dataset.py
+
+name: dnd_npc
+description: "D&D NPC roleplay — characters responding in-scene to player actions"
+
+# ---------------------------------------------------------------------------
+# Generation models
+# Names are arbitrary keys; the pipeline looks these up in the run config.
+# ---------------------------------------------------------------------------
+generators:
+  writer:
+    role: primary          # primary generators get more samples
+    prompt_file: prompts/generator_writer.txt
+    temperature: 0.9
+    max_tokens: 300
+
+  drummer:
+    role: primary
+    prompt_file: prompts/generator_drummer.txt
+    temperature: 0.95      # slightly higher — encourages distinct voice
+    max_tokens: 300
+
+  opus:
+    role: secondary        # secondary = fewer samples, higher quality bar
+    prompt_file: prompts/generator_opus.txt
+    temperature: 0.85
+    max_tokens: 800        # longer — Opus uses chain-of-thought internally
+    no_think: true         # strip <think>...</think> from output
+
+# ---------------------------------------------------------------------------
+# Reviewers
+# ---------------------------------------------------------------------------
+reviewers:
+  writer:
+    prompt_file: prompts/reviewer_writer.txt
+    pass_field: score        # field name in the JSON response
+    pass_threshold: null     # uses run config cross_review_threshold
+
+  qwen:
+    prompt_file: prompts/reviewer_qwen.txt
+    pass_field: score
+    pass_threshold: null
+
+  drummer:
+    prompt_file: prompts/reviewer_drummer.txt
+    pass_field: score
+    pass_threshold: null
+
+# ---------------------------------------------------------------------------
+# Categories — what types of samples to generate
+# Weights must sum to 1.0
+# ---------------------------------------------------------------------------
+categories:
+  - name: npc_dialogue
+    description: "NPC responding to a player action in a scene"
+    weight: 0.5
+
+  - name: npc_confrontation
+    description: "NPC in a high-stakes or adversarial encounter"
+    weight: 0.2
+
+  - name: npc_revelation
+    description: "NPC revealing important lore or personal history"
+    weight: 0.15
+
+  - name: npc_ambient
+    description: "NPC in casual/background interaction, low stakes"
+    weight: 0.15
+
+# ---------------------------------------------------------------------------
+# Lore / context sources  (injected into generation prompts)
+# ---------------------------------------------------------------------------
+lore:
+  # Kiwix Wikipedia offline search — pass topic list and the pipeline
+  # fetches relevant excerpts to ground each generated sample.
+  kiwix:
+    enabled: true
+    topics:
+      - "Forgotten Realms"
+      - "Drizzt Do'Urden"
+      - "Strahd von Zarovich"
+      - "Waterdeep"
+      - "Neverwinter"
+      - "Baldur's Gate"
+      - "Elminster Aumar"
+      - "Minsc"
+      - "Aragorn"
+      - "Gandalf"
+      - "Geralt of Rivia"
+      - "Dungeon Master"
+      - "Dungeons and Dragons"
+    max_chars: 800
+
+  # Static context always injected (e.g. campaign-specific world info)
+  # static_file: lore/world_context.txt   # optional
+
+# ---------------------------------------------------------------------------
+# HuggingFace dataset mixing
+# ---------------------------------------------------------------------------
+hf_datasets:
+  - repo: "PygmalionAI/PIPPA"
+    split: "train"
+    local_file: null        # set to local path to skip HF download
+    max_samples: 800
+    weight: 0.6
+    filter:
+      # Only keep samples that look like roleplay/character dialogue
+      min_turns: 2
+      require_system: false
+
+  - repo: "Norquinal/claude_multiround_chat_30k"
+    split: "train"
+    local_file: null
+    max_samples: 500
+    weight: 0.4
+    filter:
+      min_turns: 2
+      require_system: false
+
+# ---------------------------------------------------------------------------
+# Dataset builder config
+# ---------------------------------------------------------------------------
+dataset:
+  system_prompt: prompts/system_prompt.txt    # injected as system turn
+  human_turn: prompts/human_turn.txt          # Jinja2 template for the user turn
+  response_field: response                    # field in validated sample = assistant turn
+  generator_keys: [writer, opus, drummer]     # which validated_{key}.jsonl files to load
+
+# ---------------------------------------------------------------------------
+# Fast filter config
+# ---------------------------------------------------------------------------
+fast_filter:
+  system_prompt: fast_filter_system
+  prompt_template: fast_filter_prompt
+  score_field: score
+  max_tokens: 10
+  rate_limit_sleep: 0.2
+
+# ---------------------------------------------------------------------------
+# Cross-review config
+# ---------------------------------------------------------------------------
+cross_review:
+  prompt_template: cross_review_prompt
+  max_tokens: 80
+  rate_limit_sleep: 0.3
+
+# ---------------------------------------------------------------------------
+# Output format validation — what a valid generated sample looks like
+# ---------------------------------------------------------------------------
+validation:
+  must_match:
+    - "\\*.*\\*"      # must have *italics action*
+    - '"'             # must have quoted dialogue
+  max_lines: 8
+
+# ---------------------------------------------------------------------------
+# Output format
+# ---------------------------------------------------------------------------
+output:
+  format: sharegpt           # sharegpt | alpaca | completion
+  chat_template: chatml      # chatml | llama3 | mistral
+  system_role: system
+  user_role: human
+  assistant_role: gpt

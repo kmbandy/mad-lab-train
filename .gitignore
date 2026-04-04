@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+*.log
+*.log.*
+
+# Large training data dirs (too large for git — stored locally at ~/.mad-lab-mcp/chromadb adjacent)
+quant-finetune/data/
+kaggle-finetune/dataset/
+kaggle-finetune/eng2-dataset/
+kaggle-finetune/eng2-kernel/
+kaggle-finetune/kernel/
+npc/output/
+npc/data/
+datasets/
+
+# Model outputs
+*.bin
+*.safetensors
+*.gguf
+adapter_model/
+checkpoint-*/
+runs/

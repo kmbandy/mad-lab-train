@@ -1,0 +1,53 @@
+# Run config for D&D NPC pipeline
+# Pass this to all pipeline/* scripts via --config
+
+# ---------------------------------------------------------------------------
+# LLM endpoints (all point to main PC — swap models as needed)
+# ---------------------------------------------------------------------------
+writer_api_base: "http://192.168.1.15:8080/v1"
+writer_model: "default"
+
+opus_api_base: "http://192.168.1.15:8080/v1"
+opus_model: "default"
+
+drummer_api_base: "http://192.168.1.15:8080/v1"
+drummer_model: "default"
+
+qwen_api_base: "http://192.168.1.15:8080/v1"
+qwen_model: "default"
+
+# Fast filter — OmniCoder-9B on GTX 1070 (stop before training!)
+fast_filter_api_base: "http://127.0.0.1:8080/v1"
+fast_filter_model: "omnicoder"
+
+# ---------------------------------------------------------------------------
+# Lore
+# ---------------------------------------------------------------------------
+chromadb_path: "/home/kmbandy/.mad-lab-mcp/chromadb"
+kiwix_base: "http://localhost:8091/content/wikipedia_en_all_maxi_2026-02"
+
+# ---------------------------------------------------------------------------
+# Generation targets
+# ---------------------------------------------------------------------------
+samples_writer:  300
+samples_opus:    150
+samples_drummer: 300
+samples_per_model: 300   # fallback
+
+concurrency: 4           # match llama-server --parallel
+
+# ---------------------------------------------------------------------------
+# Validation thresholds
+# ---------------------------------------------------------------------------
+min_quality_score: 0.6
+cross_review_threshold: 0.8
+
+# ---------------------------------------------------------------------------
+# Dataset mixing
+# ---------------------------------------------------------------------------
+hf_target_total: 2500
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+output_dir: "/home/kmbandy/mad-lab-dnd/training/data/pipeline_out"

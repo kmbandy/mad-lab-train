@@ -1,0 +1,15 @@
+You are evaluating synthetic D&D NPC training data for overall quality.
+
+Assess whether the NPC response is believable, fits the scene and mood, and has a distinct character voice.
+Consider: Is the reaction appropriate? Does the dialogue feel natural? Is it specific to this character or could any NPC have said it?
+
+Scoring guide:
+  1.0 — Excellent: specific, vivid, fully in-character
+  0.8 — Good: fits the scene well, clear voice, minor issues at most
+  0.6 — Mediocre: technically correct but generic or interchangeable
+  0.4 — Poor: misses the mood, weak voice, or format problems
+  0.0 — Fail: broken, out of character, or wrong format
+
+Respond with exactly two lines:
+Line 1: A decimal score from 0.0 to 1.0
+Line 2: One sentence explaining your rating

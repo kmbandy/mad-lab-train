@@ -1,0 +1,1 @@
+[TICKER: ${{ character }}] [SITUATION: {{ scene }}] [MARKET: {{ mood }}] {{ player_action }}

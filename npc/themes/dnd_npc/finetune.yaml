@@ -1,0 +1,22 @@
+# Fine-tune config for D&D NPC theme
+# Used by: pipeline/train.py
+
+base_model: /home/kmbandy/models/SmolLM3-3B-Base
+output_dir: /home/kmbandy/mad-lab-dnd/training/output/smollm3-npc
+
+# Data (defaults to run config output_dir/train.jsonl if not set)
+# train_data: /home/kmbandy/mad-lab-dnd/training/data/train.jsonl
+# eval_data:  /home/kmbandy/mad-lab-dnd/training/data/eval.jsonl
+
+# Training
+num_epochs: 3
+micro_batch_size: 1
+gradient_accumulation_steps: 16
+learning_rate: 2e-4
+warmup_steps: 20
+sequence_len: 2048
+
+# LoRA
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.05

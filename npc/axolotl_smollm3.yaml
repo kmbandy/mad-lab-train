@@ -1,0 +1,63 @@
+# QLoRA fine-tune config for SmolLM3-3B-Base on GTX 1070 8GB
+# Dataset: D&D NPC training data (ShareGPT format, 2250 train / 249 eval)
+# Target: NPC roleplay model to replace flammen23X on npc-1/npc-2
+
+base_model: /home/kmbandy/models/SmolLM3-3B-Base
+model_type: AutoModelForCausalLM
+tokenizer_type: AutoTokenizer
+
+# GTX 1070 — sm_61, no bf16 support
+fp16: true
+bf16: false
+
+# QLoRA — 4-bit quantization to fit 3B model in 8GB
+load_in_4bit: true
+adapter: qlora
+
+# LoRA config
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.05
+lora_target_linear: true   # targets all linear layers
+lora_fan_in_fan_out: false
+
+# Dataset
+datasets:
+  - path: /home/kmbandy/mad-lab-dnd/training/data/train.jsonl
+    type: sharegpt
+    conversation: chatml
+
+val_set_path: /home/kmbandy/mad-lab-dnd/training/data/eval.jsonl
+
+# Sequence / memory
+sequence_len: 2048
+sample_packing: false        # disable — safer for small datasets + QLoRA
+pad_to_sequence_len: false
+
+# Training
+num_epochs: 3
+micro_batch_size: 1
+gradient_accumulation_steps: 16   # effective batch size = 16
+learning_rate: 2e-4
+lr_scheduler: cosine
+warmup_ratio: 0.05
+weight_decay: 0.01
+max_grad_norm: 1.0
+optimizer: adamw_bnb_8bit       # 8-bit adam — saves VRAM
+
+# Output
+output_dir: /home/kmbandy/mad-lab-dnd/training/output/smollm3-npc
+save_steps: 100
+eval_steps: 100
+logging_steps: 10
+save_total_limit: 2
+
+# Hardware
+gradient_checkpointing: true    # trade compute for memory
+flash_attention: false          # sm_61 doesn't support flash attn
+
+# Misc
+seed: 42
+strict: false
+special_tokens:
+  pad_token: "<|end_of_text|>"

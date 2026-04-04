@@ -1,0 +1,63 @@
+# Round 2 synthetic data generation config
+# Models: Writer (300) + Drummer (300) + Opus (150)
+# Reviews: Qwen reviews Writer, Writer reviews Drummer + Opus
+
+# LLM endpoints (all point to main PC — only one loaded at a time)
+writer_api_base: "http://192.168.1.15:8080/v1"
+writer_model: "default"
+
+opus_distill_api_base: "http://192.168.1.15:8080/v1"
+opus_distill_model: "default"
+
+drummer_api_base: "http://192.168.1.15:8080/v1"
+drummer_model: "default"
+
+qwen_api_base: "http://192.168.1.15:8080/v1"
+qwen_model: "default"
+
+# Fast filter model — OmniCoder-9B on GTX 1070 CUDA (port 8080)
+fast_filter_api_base: "http://127.0.0.1:8080/v1"
+fast_filter_model: "omnicoder"
+
+# ChromaDB
+chromadb_path: "/home/kmbandy/.mad-lab-mcp/chromadb"
+
+# Per-model generation targets
+samples_writer:  300
+samples_opus:    150
+samples_drummer: 300
+samples_per_model: 300  # fallback
+
+min_quality_score: 0.6       # fast filter threshold
+cross_review_threshold: 0.8  # cross-review pass threshold
+
+# Output — separate dir to preserve round 1 data
+output_dir: "/home/kmbandy/mad-lab-dnd/training/data/r2"
+final_dataset: "/home/kmbandy/mad-lab-dnd/training/data/r2/dataset.jsonl"
+
+# HuggingFace dataset mixing (same targets as round 1)
+hf_target_total: 2500
+hf_datasets:
+  - repo: "PygmalionAI/PIPPA"
+    split: "train"
+    max_samples: 800
+    weight: 0.6
+  - repo: "Norquinal/claude_multiround_chat_30k"
+    split: "train"
+    max_samples: 500
+    weight: 0.4
+
+# Categories (same weights as round 1)
+categories:
+  - name: npc_dialogue
+    description: "NPC responding to a player action in a scene"
+    weight: 0.5
+  - name: npc_confrontation
+    description: "NPC in a high-stakes or adversarial encounter"
+    weight: 0.2
+  - name: npc_revelation
+    description: "NPC revealing important lore or personal history"
+    weight: 0.15
+  - name: npc_ambient
+    description: "NPC in casual/background interaction, low stakes"
+    weight: 0.15

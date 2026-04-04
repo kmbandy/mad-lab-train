@@ -1,0 +1,60 @@
+# Synthetic data generation config for D&D NPC fine-tune
+
+# LLM endpoints (both point to main PC 27B models)
+writer_api_base: "http://192.168.1.15:8080/v1"
+writer_model: "default"
+
+opus_distill_api_base: "http://192.168.1.15:8080/v1"
+opus_distill_model: "default"
+
+drummer_api_base: "http://192.168.1.15:8080/v1"
+drummer_model: "default"
+
+qwen_api_base: "http://192.168.1.15:8080/v1"
+qwen_model: "default"
+
+# Fast filter model — OmniCoder-9B on GTX 1070 CUDA (port 8080)
+# Much faster than Gemma-1B CPU for scoring 1000+ samples
+# Note: swap to port 8084 if running in D&D mode (flammen23X on 1070)
+fast_filter_api_base: "http://127.0.0.1:8080/v1"
+fast_filter_model: "omnicoder"
+
+# ChromaDB
+chromadb_path: "/home/kmbandy/.mad-lab-mcp/chromadb"
+
+# Generation targets
+samples_per_model: 500       # raw samples to generate per model per category
+min_quality_score: 0.6       # Gemma-1B filter threshold (0.0-1.0)
+cross_review_threshold: 0.8  # cross-review pass threshold
+
+# Output
+output_dir: "/home/kmbandy/mad-lab-dnd/training/data"
+final_dataset: "/home/kmbandy/mad-lab-dnd/training/data/dataset.jsonl"
+
+# HuggingFace dataset mixing
+# Total target: ~1500 samples (300-400 synthetic + ~1100-1200 HF)
+hf_target_total: 2500          # target total after mixing
+hf_datasets:
+  - repo: "PygmalionAI/PIPPA"
+    split: "train"
+    max_samples: 800           # filter down from ~26k conversations
+    weight: 0.6                # 60% of HF quota
+  - repo: "Norquinal/claude_multiround_chat_30k"
+    split: "train"
+    max_samples: 500           # 40% of HF quota
+    weight: 0.4
+
+# Categories of training examples to generate
+categories:
+  - name: npc_dialogue
+    description: "NPC responding to a player action in a scene"
+    weight: 0.5
+  - name: npc_confrontation
+    description: "NPC in a high-stakes or adversarial encounter"
+    weight: 0.2
+  - name: npc_revelation
+    description: "NPC revealing important lore or personal history"
+    weight: 0.15
+  - name: npc_ambient
+    description: "NPC in casual/background interaction, low stakes"
+    weight: 0.15

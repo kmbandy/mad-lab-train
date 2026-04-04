@@ -1,0 +1,12 @@
+Generate one training example for category: {{ category }}
+
+{{ lore_context }}
+
+Stock/Ticker: {{ character.ticker }} ({{ character.sector }})
+Context: {{ character.desc }}
+
+Situation: {{ scene }}
+Market condition: {{ mood }}
+Question/prompt: {{ player_action }}
+
+Write the analyst's response (3-6 sentences, reference specific data, include ticker with $):

@@ -1,0 +1,9 @@
+Review this NPC training sample:
+
+Character: {{ character }}
+Scene: {{ scene }}
+Mood: {{ mood }}
+Player action: {{ player_action }}
+
+NPC response:
+{{ response }}

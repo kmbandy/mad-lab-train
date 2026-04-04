@@ -1,0 +1,5 @@
+# Run config for stock_analyst pipeline
+# Pass to pipeline/* scripts via --config
+# Note: generation/validation stages require main PC (arch-1) — skip for ZIM-only runs
+
+output_dir: /home/kmbandy/mad-lab-mcp/datasets/stock_analyst_pipeline_out

@@ -1,0 +1,75 @@
+# "Characters" for stock analyst theme = stock/asset profiles
+# Each entry represents a ticker with context the generator uses to ground responses.
+# Add your actual watchlist here — the more specific, the better the training data.
+
+characters:
+  # Mega cap tech
+  - ticker: "AAPL"
+    sector: "Technology / Consumer Electronics"
+    desc: "Apple Inc. — iPhone supercycle plays, services margin expansion, China exposure risk. P/E ~28. Strong buyback program."
+
+  - ticker: "NVDA"
+    sector: "Technology / Semiconductors"
+    desc: "NVIDIA — AI GPU dominance, data center revenue ~80% of mix. Valuation rich (P/E 50+). Supply constraints easing."
+
+  - ticker: "MSFT"
+    sector: "Technology / Cloud / Enterprise"
+    desc: "Microsoft — Azure growth, Copilot monetization, LinkedIn and gaming. Steady compounder. P/E ~33."
+
+  - ticker: "GOOGL"
+    sector: "Technology / Advertising / Cloud"
+    desc: "Alphabet — search ad dominance, YouTube, GCP. AI search disruption risk. P/E ~22, trading at discount to peers."
+
+  - ticker: "META"
+    sector: "Technology / Social Media"
+    desc: "Meta Platforms — ad revenue recovery, Reality Labs burn, Llama/AI investment cycle. P/E ~25."
+
+  # Finance
+  - ticker: "JPM"
+    sector: "Financials / Banking"
+    desc: "JPMorgan Chase — net interest income sensitivity to rate cuts, investment banking cycle, fortress balance sheet."
+
+  - ticker: "BRK.B"
+    sector: "Financials / Conglomerate"
+    desc: "Berkshire Hathaway — insurance float, energy, rail, large equity portfolio. Cash pile ~$160B. Value anchor."
+
+  # Consumer / retail
+  - ticker: "AMZN"
+    sector: "Technology / E-commerce / Cloud"
+    desc: "Amazon — AWS margin expansion, advertising growth, retail margin recovery. FCF story improving rapidly."
+
+  - ticker: "WMT"
+    sector: "Consumer Staples / Retail"
+    desc: "Walmart — grocery market share gains, advertising business, international. Defensive with growth optionality."
+
+  # Energy
+  - ticker: "XOM"
+    sector: "Energy / Oil & Gas"
+    desc: "ExxonMobil — Permian growth, Pioneer acquisition synergies, LNG exposure. FCF yield ~7% at $80 oil."
+
+  # Healthcare
+  - ticker: "LLY"
+    sector: "Healthcare / Pharmaceuticals"
+    desc: "Eli Lilly — GLP-1 (Mounjaro/Zepbound) demand outpacing supply, obesity/diabetes TAM massive. Expensive but growth justifies."
+
+  # Small/mid cap speculative
+  - ticker: "HOOD"
+    sector: "Financials / Fintech"
+    desc: "Robinhood — retail trading activity correlated, crypto revenue volatile, Gold subscription growing. High beta."
+
+  - ticker: "PLTR"
+    sector: "Technology / Government/Enterprise AI"
+    desc: "Palantir — AIP platform, US commercial acceleration, government contract base. Volatile, high valuation (~100x P/E)."
+
+  # Index / macro proxies
+  - ticker: "SPY"
+    sector: "ETF / S&P 500"
+    desc: "S&P 500 ETF — broad market exposure, macro indicator. Used for market-wide analysis and hedging."
+
+  - ticker: "QQQ"
+    sector: "ETF / Nasdaq 100"
+    desc: "Nasdaq 100 ETF — tech-heavy, rate sensitive, AI narrative proxy."
+
+  - ticker: "TLT"
+    sector: "ETF / Long-term Treasuries"
+    desc: "20+ year Treasury ETF — inverse rate relationship, flight-to-safety indicator, macro positioning tool."

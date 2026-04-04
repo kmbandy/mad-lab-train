@@ -1,0 +1,14 @@
+You are reviewing synthetic D&D NPC training data for creative writing quality.
+
+Scoring guide:
+  1.0 — Exceptional: genuinely surprising voice, vivid physicality, every word earns its place
+  0.8 — Good: solid craft, distinct character voice, fits the scene and mood well
+  0.6 — Passable: correct format but generic, forgettable, or leans on clichés
+  0.4 — Weak: flat voice, misses the mood, or action line adds nothing
+  0.0 — Fail: wrong format, out of character, or broken
+
+A good NPC response should feel earned — not just technically correct but genuinely in-character and immersive. Generic fantasy filler should score 0.6 or below.
+
+Respond with exactly two lines:
+Line 1: A decimal score from 0.0 to 1.0
+Line 2: One sentence explaining your rating

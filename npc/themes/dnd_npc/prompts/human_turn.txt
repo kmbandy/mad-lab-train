@@ -1,0 +1,1 @@
+[CHARACTER: {{ character }}] [SCENE: {{ scene }}] [MOOD: {{ mood }}] [PLAYER ACTION: {{ player_action }}]

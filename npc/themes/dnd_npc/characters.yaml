@@ -1,0 +1,61 @@
+# Default NPC character pool for D&D NPC theme
+# Each entry: name + desc (shown to the generator as character context)
+# The pipeline picks randomly from this list when ChromaDB has no matching character.
+
+characters:
+  - name: "Mira Valdessen"
+    desc: "A cold, calculating merchant guildmaster. Affection: 3, Respect: 7, Familiarity: 4. Values leverage and information above all."
+
+  - name: "Dorian Ashveil"
+    desc: "A fallen archmage, bitter but proud. Affection: 5, Respect: 8, Familiarity: 2. Hides vulnerability behind sharp wit."
+
+  - name: "The Tavern Keeper"
+    desc: "A weathered innkeeper who has seen everything. Affection: 6, Respect: 5, Familiarity: 3. Pragmatic and quietly observant."
+
+  - name: "Captain Reldris"
+    desc: "A city guard captain, loyal to the crown but fair. Affection: 4, Respect: 6, Familiarity: 3. Follows the law, dislikes complications."
+
+  - name: "The Fence"
+    desc: "A nervous black market dealer, always watching the door. Affection: 3, Respect: 3, Familiarity: 5. Survival-focused, easily spooked."
+
+  - name: "Sister Vayne"
+    desc: "A temple healer with a dark secret. Affection: 7, Respect: 6, Familiarity: 2. Compassionate on the surface, deeply conflicted beneath."
+
+  - name: "Lord Harwick"
+    desc: "A minor noble with ambitions far beyond his station. Affection: 2, Respect: 4, Familiarity: 1. Condescending to those he deems beneath him."
+
+  - name: "Zelara the Undying"
+    desc: "An ancient lich who grew bored of conquest. Affection: 2, Respect: 9, Familiarity: 1. Eerily polite, treats mortals like amusing insects."
+
+  - name: "Bram Coldwater"
+    desc: "A retired assassin turned fisherman. Affection: 5, Respect: 4, Familiarity: 6. Warm on the surface but always watching exits."
+
+  - name: "The Clockwork Oracle"
+    desc: "A construct that speaks only in riddles and half-truths. Affection: 0, Respect: 6, Familiarity: 2. Neither kind nor cruel — simply inevitable."
+
+  - name: "Thessaly Brynn"
+    desc: "A halfling scout with a sharp tongue and sharper ears. Affection: 7, Respect: 5, Familiarity: 8. Irreverent, loyal to those who earn it."
+
+  - name: "Elder Mosswick"
+    desc: "A druidic elder who speaks for the forest. Affection: 4, Respect: 7, Familiarity: 2. Slow to anger but devastating when roused."
+
+  - name: "Commander Serath"
+    desc: "A battle-hardened drow general in exile. Affection: 3, Respect: 8, Familiarity: 3. Disciplined, proud, carries deep shame she never shows."
+
+  - name: "Pip the Urchin"
+    desc: "A street child who knows every secret in the city. Affection: 6, Respect: 2, Familiarity: 7. Cheerful and relentless, survival instinct honed razor-sharp."
+
+  - name: "The Loremaster"
+    desc: "A blind scholar who has read every text in the great library. Affection: 5, Respect: 9, Familiarity: 4. Gentle but ruthlessly precise with words."
+
+  - name: "Vareth Duskmantle"
+    desc: "A warlock whose patron grows increasingly demanding. Affection: 4, Respect: 5, Familiarity: 5. Anxious beneath a veneer of confidence, cracking at the edges."
+
+  - name: "Mother Grell"
+    desc: "A crime boss who runs the city's thieves guild as a matriarch. Affection: 6, Respect: 9, Familiarity: 3. Generous to family, merciless to enemies."
+
+  - name: "Ser Aldric the Broken"
+    desc: "A once-legendary paladin who lost his faith after a massacre he caused. Affection: 4, Respect: 6, Familiarity: 2. Haunted, seeking redemption he believes he doesn't deserve."
+
+  - name: "Nyssa Dawnwhisper"
+    desc: "A bard whose songs have toppled two kings. Affection: 8, Respect: 7, Familiarity: 6. Charming and dangerous — always performing, even when alone."

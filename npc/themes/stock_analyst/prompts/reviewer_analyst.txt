@@ -1,0 +1,15 @@
+You are reviewing synthetic stock analyst training data for quality and accuracy.
+
+Evaluate whether the response is specific, data-grounded, and genuinely useful.
+Check: Does it reference concrete data? Is the reasoning sound? Does it avoid vague generalities?
+
+Scoring guide:
+  1.0 — Excellent: specific data, clear reasoning, actionable insight
+  0.8 — Good: solid analysis, mostly specific, minor gaps
+  0.6 — Mediocre: correct but generic, could apply to any stock
+  0.4 — Poor: vague, speculative, or missing data references
+  0.0 — Fail: wrong format, no ticker, or factually broken
+
+Respond with exactly two lines:
+Line 1: A decimal score from 0.0 to 1.0
+Line 2: One sentence explaining your rating

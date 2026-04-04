@@ -1,0 +1,12 @@
+Generate one training example for category: {{ category }}
+
+{{ lore_context }}
+
+Character: {{ character.name }}
+{{ character.desc }}
+
+Scene: {{ scene }}
+Mood: {{ mood }}
+Player action: {{ player_action }}
+
+Write the NPC's response now (remember: *italics action* then "dialogue", 2-4 sentences max):

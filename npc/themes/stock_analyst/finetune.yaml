@@ -1,0 +1,41 @@
+# Fine-tune config for stock_analyst theme
+# Used by: pipeline/train.py
+# Model: NVIDIA-Nemotron-3-Nano-4B-FP8 — loaded in fp16 (GTX 1070 is sm_61, no native FP8)
+
+base_model: /home/kmbandy/models/NVIDIA-Nemotron-3-Nano-4B-FP8
+output_dir: /home/kmbandy/models/nemotron-4b-quant-lora
+
+train_data: /home/kmbandy/mad-lab-mcp/datasets/quant_train.jsonl
+eval_data:  /home/kmbandy/mad-lab-mcp/datasets/quant_eval.jsonl
+
+# Training (local defaults — OOM-safe for GTX 1070 8GB)
+num_epochs: 2
+micro_batch_size: 1
+gradient_accumulation_steps: 16
+learning_rate: 0.0002
+warmup_steps: 50
+sequence_len: 128        # Mamba-2 backward — OOM at 256 on 1070; use Kaggle for real runs
+
+# LoRA (local — reduced for 1070 VRAM)
+lora_r: 8               # r=16 OOMs on 1070; use Kaggle config overrides for r=16
+lora_alpha: 16
+lora_dropout: 0.05
+
+# ── Kaggle cloud training ──────────────────────────────────────────────────────
+# Set training_env: kaggle to ship this to Kaggle T4 (16GB) automatically.
+# Run: python3 pipeline/train.py --config run_stock_analyst.yaml --theme themes/stock_analyst
+#
+training_env: kaggle
+
+kaggle:
+  dataset_id:    kurtisbandy/quant-stack-finetune-data
+  kernel_id:     kurtisbandy/nemotron-4b-quant-lora
+  model_hf_id:   nvidia/NVIDIA-Nemotron-3-Nano-4B-FP8
+  model_patches: nemotron_h   # applies Nemotron-H mlp block patches + chunk_size=64
+
+  # T4 has 16GB — use better settings than the 1070 allows
+  sequence_len: 512
+  lora_r: 16
+  lora_alpha: 32
+  num_epochs: 2
+  gradient_accumulation_steps: 8

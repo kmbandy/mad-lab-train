@@ -1,0 +1,130 @@
+# Stock Analyst Theme
+# Fine-tune a small model to reason about stock data, earnings, technicals,
+# and trade signals in the context of your specific strategy + watchlist.
+
+name: stock_analyst
+description: "Stock market analyst — interpreting data, identifying signals, reasoning about trades"
+
+# ---------------------------------------------------------------------------
+# Generators
+# ---------------------------------------------------------------------------
+generators:
+  analyst:
+    role: primary
+    prompt_file: prompts/generator_analyst.txt
+    temperature: 0.7      # lower = more consistent analytical output
+    max_tokens: 400
+
+  critic:
+    role: secondary       # devil's advocate — generates bearish/contrarian takes
+    prompt_file: prompts/generator_critic.txt
+    temperature: 0.75
+    max_tokens: 400
+
+# ---------------------------------------------------------------------------
+# Reviewers
+# ---------------------------------------------------------------------------
+reviewers:
+  analyst:
+    prompt_file: prompts/reviewer_analyst.txt
+    pass_field: score
+
+# ---------------------------------------------------------------------------
+# Categories
+# ---------------------------------------------------------------------------
+categories:
+  - name: earnings_analysis
+    description: "Interpreting earnings report data — beats/misses, guidance, key metrics"
+    weight: 0.3
+
+  - name: technical_pattern
+    description: "Identifying and explaining chart patterns, support/resistance, indicators"
+    weight: 0.25
+
+  - name: news_sentiment
+    description: "Analyzing market-moving news and its likely price impact"
+    weight: 0.2
+
+  - name: trade_signal
+    description: "Synthesizing data into a concrete trade thesis (entry, target, invalidation)"
+    weight: 0.15
+
+  - name: risk_assessment
+    description: "Identifying risks and position sizing considerations for a trade"
+    weight: 0.1
+
+# ---------------------------------------------------------------------------
+# Lore / context sources
+# ---------------------------------------------------------------------------
+lore:
+  # Kiwix — financial reference material
+  kiwix:
+    enabled: true
+    topics:
+      - "Earnings per share"
+      - "Price–earnings ratio"
+      - "Moving average"
+      - "Relative strength index"
+      - "MACD"
+      - "Bollinger Bands"
+      - "Short selling"
+      - "Market capitalization"
+      - "Bull market"
+      - "Bear market"
+      - "Options (finance)"
+      - "Technical analysis"
+      - "Fundamental analysis"
+    max_chars: 600
+
+  # Static context — your watchlist, strategy rules, etc.
+  # static_file: lore/strategy_context.txt   # uncomment when ready
+
+# ---------------------------------------------------------------------------
+# Dataset builder config
+# ---------------------------------------------------------------------------
+dataset:
+  system_prompt: prompts/system_prompt.txt
+  human_turn: prompts/human_turn.txt
+  response_field: response
+  generator_keys: [analyst, critic]
+
+# ---------------------------------------------------------------------------
+# Fast filter
+# ---------------------------------------------------------------------------
+fast_filter:
+  system_prompt: fast_filter_system
+  prompt_template: fast_filter_prompt
+  score_field: score
+  max_tokens: 10
+  rate_limit_sleep: 0.2
+
+# ---------------------------------------------------------------------------
+# Cross-review
+# ---------------------------------------------------------------------------
+cross_review:
+  prompt_template: cross_review_prompt
+  max_tokens: 100
+  rate_limit_sleep: 0.3
+
+# ---------------------------------------------------------------------------
+# Validation — what a valid generated sample looks like
+# ---------------------------------------------------------------------------
+validation:
+  must_match:
+    - "\\$[A-Z]+"       # must reference at least one ticker symbol
+  max_lines: 20
+
+# ---------------------------------------------------------------------------
+# HF dataset mixing (placeholder — swap for finance-specific datasets)
+# ---------------------------------------------------------------------------
+hf_datasets: []
+
+# ---------------------------------------------------------------------------
+# Output format
+# ---------------------------------------------------------------------------
+output:
+  format: sharegpt
+  chat_template: chatml
+  system_role: system
+  user_role: human
+  assistant_role: gpt
