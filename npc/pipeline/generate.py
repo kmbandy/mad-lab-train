@@ -40,6 +40,13 @@ class Theme:
 
         self.name: str = self.cfg["name"]
 
+        # Validate theme config at load time — raises SystemExit with clear message on error
+        try:
+            from schema import load_theme_config
+            self._validated = load_theme_config(theme_dir)
+        except ImportError:
+            pass  # schema.py not yet available
+
         # Prompt files
         self._prompt_cache: dict[str, str] = {}
 

@@ -244,6 +244,8 @@ def main() -> None:
                         help="Extra dirs to load validated samples from (dataset stage)")
     parser.add_argument("--concurrency", type=int, default=None,
                         help="Override concurrency for generate stage")
+    parser.add_argument("--validate-config", action="store_true",
+                        help="Validate all config files and exit without running stages")
     args = parser.parse_args()
 
     # ---- Resolve paths ----
@@ -266,6 +268,19 @@ def main() -> None:
 
     with open(config_path) as f:
         run_cfg = yaml.safe_load(f)
+
+    # ---- Validate configs (always) ----
+    sys.path.insert(0, str(PIPELINE_DIR))
+    try:
+        from schema import load_run_config, load_theme_config, load_finetune_config
+        load_run_config(config_path)
+        load_theme_config(theme_path)
+        load_finetune_config(theme_path, run_cfg)
+        if args.validate_config:
+            print("All configs valid.")
+            sys.exit(0)
+    except ImportError:
+        pass  # schema.py not yet available
 
     # ---- Determine stages ----
     if args.stages is None or args.stages == ["all"]:
