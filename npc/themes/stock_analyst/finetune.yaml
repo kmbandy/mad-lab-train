@@ -39,3 +39,20 @@ kaggle:
   lora_alpha: 32
   num_epochs: 2
   gradient_accumulation_steps: 8
+
+# Optional overrides (defaults shown):
+# weight_decay: 0.01
+# max_grad_norm: 1.0
+# gradient_checkpointing: false
+# packing: false
+# lr_scheduler_type: cosine    # cosine | linear | constant
+# logging_steps: 10
+# eval_steps: 100
+# save_steps: 100
+# save_total_limit: 2
+# seed: 42
+# lora_target_modules: all-linear
+# report_to: none              # none | wandb | tensorboard
+# wandb_project: my-project    # only used if report_to: wandb
+
+(End of file — 41 lines total)

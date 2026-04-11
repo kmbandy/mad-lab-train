@@ -20,3 +20,18 @@ sequence_len: 2048
 lora_r: 16
 lora_alpha: 32
 lora_dropout: 0.05
+
+# Optional overrides (defaults shown):
+# weight_decay: 0.01
+# max_grad_norm: 1.0
+# gradient_checkpointing: false
+# packing: false
+# lr_scheduler_type: cosine    # cosine | linear | constant
+# logging_steps: 10
+# eval_steps: 100
+# save_steps: 100
+# save_total_limit: 2
+# seed: 42
+# lora_target_modules: all-linear
+# report_to: none              # none | wandb | tensorboard
+# wandb_project: my-project    # only used if report_to: wandb
