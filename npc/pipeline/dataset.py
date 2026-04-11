@@ -27,6 +27,207 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent))
 from generate import Theme
 
+# -------------------------------------------------
+# HF dataset loading (config‑driven)
+# -------------------------------------------------
+import json
+from pathlib import Path
+from typing import Any
+from schema import HFDatasetLoader
+
+def _load_rows(repo: str, split: str, max_samples: int, local_file: str | None) -> list[dict]:
+    """Pure I/O – load raw rows from a local JSONL or HF dataset."""
+    if local_file and Path(local_file).exists():
+        print(f"  Loading {repo} from local file {local_file}…")
+        rows: list[dict] = []
+        with open(local_file) as f:
+            for line in f:
+                if len(rows) >= max_samples:
+                    break
+                try:
+                    rows.append(json.loads(line))
+                except Exception:
+                    continue
+        return rows
+    else:
+        print(f"  Downloading {repo} from HuggingFace…")
+        from datasets import load_dataset
+        ds = load_dataset(repo, split=split, trust_remote_code=True)
+        return list(ds)[:max_samples]
+
+def _detect_format(rows: list[dict]) -> str:
+    """Detect dataset format (sharegpt, chatml, alpaca)."""
+    if not rows:
+        return "sharegpt"
+    row = rows[0]
+    if "conversations" in row:
+        return "sharegpt"
+    if "messages" in row:
+        return "chatml"
+    if "instruction" in row or "output" in row:
+        return "alpaca"
+    return "sharegpt"
+
+def _load_sharegpt(rows: list[dict], cfg: HFDatasetLoader, theme: Theme) -> list[dict]:
+    ds_cfg = theme.cfg.get("dataset", {})
+    out_cfg = theme.cfg.get("output", {})
+    sys_role = out_cfg.get("system_role", "system")
+    user_role = out_cfg.get("user_role", "human")
+    asst_role = out_cfg.get("assistant_role", "gpt")
+    system_prompt = theme.prompt(
+        ds_cfg.get("system_prompt", "prompts/system_prompt")
+        .replace("prompts/", "").replace(".txt", "")
+    )
+    conv_field = cfg.column_map.get("conversations", "conversations")
+    samples: list[dict] = []
+    for row in rows:
+        convos = row.get(conv_field, [])
+        if not isinstance(convos, list) or len(convos) < 2:
+            continue
+        system_val = system_prompt
+        human_val: str | None = None
+        asst_val: str | None = None
+        for turn in convos:
+            role = turn.get("from") or turn.get("role", "")
+            val = (turn.get("value") or turn.get("content", "")).strip()
+            if role in ("system",) and not human_val:
+                if any(kw in val.lower() for kw in ["character", "roleplay", "persona", "analyst", "assistant", "npc"]):
+                    system_val = val
+            elif role in ("human", "user") and human_val is None:
+                if val.startswith("system") and "\n" in val:
+                    parts = val.split("\n", 1)
+                    system_val = parts[0].replace("system", "").strip() or system_val
+                    human_val = parts[1].strip()
+                else:
+                    human_val = val
+            elif role in ("gpt", "assistant") and human_val is not None:
+                asst_val = val
+                break
+        if not human_val or not asst_val:
+            continue
+        if len(asst_val) < 20 or len(asst_val) > 1200:
+            continue
+        samples.append({
+            "conversations": [
+                {"from": sys_role, "value": system_val},
+                {"from": user_role, "value": human_val},
+                {"from": asst_role, "value": asst_val},
+            ],
+            "_meta": {
+                "id": "",
+                "source": f"hf_{cfg.repo.split('/')[-1].lower()}",
+                "source_model": cfg.repo,
+                "category": "",
+            },
+        })
+    return samples
+
+def _load_alpaca(rows: list[dict], cfg: HFDatasetLoader, theme: Theme) -> list[dict]:
+    ds_cfg = theme.cfg.get("dataset", {})
+    out_cfg = theme.cfg.get("output", {})
+    sys_role = out_cfg.get("system_role", "system")
+    user_role = out_cfg.get("user_role", "human")
+    asst_role = out_cfg.get("assistant_role", "gpt")
+    system_prompt = theme.prompt(
+        ds_cfg.get("system_prompt", "prompts/system_prompt")
+        .replace("prompts/", "").replace(".txt", "")
+    )
+    sys_col = cfg.column_map.get("system", "system_prompt")
+    human_col = cfg.column_map.get("human", "instruction")
+    input_col = cfg.column_map.get("input", "input")
+    asst_col = cfg.column_map.get("assistant", "output")
+    samples: list[dict] = []
+    for row in rows:
+        system_val = row.get(sys_col, system_prompt)
+        human_val = row.get(human_col) or row.get(input_col)
+        asst_val = row.get(asst_col)
+        if not human_val or not asst_val:
+            continue
+        human_val = str(human_val).strip()
+        asst_val = str(asst_val).strip()
+        if len(asst_val) < 20 or len(asst_val) > 1200:
+            continue
+        samples.append({
+            "conversations": [
+                {"from": sys_role, "value": system_val},
+                {"from": user_role, "value": human_val},
+                {"from": asst_role, "value": asst_val},
+            ],
+            "_meta": {
+                "id": "",
+                "source": f"hf_{cfg.repo.split('/')[-1].lower()}",
+                "source_model": cfg.repo,
+                "category": "",
+            },
+        })
+    return samples
+
+def _load_chatml(rows: list[dict], cfg: HFDatasetLoader, theme: Theme) -> list[dict]:
+    ds_cfg = theme.cfg.get("dataset", {})
+    out_cfg = theme.cfg.get("output", {})
+    sys_role = out_cfg.get("system_role", "system")
+    user_role = out_cfg.get("user_role", "human")
+    asst_role = out_cfg.get("assistant_role", "gpt")
+    system_prompt = theme.prompt(
+        ds_cfg.get("system_prompt", "prompts/system_prompt")
+        .replace("prompts/", "").replace(".txt", "")
+    )
+    msgs_field = cfg.column_map.get("messages", "messages")
+    samples: list[dict] = []
+    for row in rows:
+        msgs = row.get(msgs_field, [])
+        if not isinstance(msgs, list) or len(msgs) < 2:
+            continue
+        system_val = system_prompt
+        human_val: str | None = None
+        asst_val: str | None = None
+        for turn in msgs:
+            role = turn.get("role") or turn.get("from", "")
+            content = turn.get("content") or turn.get("value", "")
+            if not role:
+                continue
+            role = role.lower()
+            if role == "system" and not human_val:
+                if any(kw in content.lower() for kw in ["character", "roleplay", "persona", "analyst", "assistant", "npc"]):
+                    system_val = content
+            elif role in ("user", "human") and human_val is None:
+                human_val = content
+            elif role in ("assistant", "gpt") and human_val is not None:
+                asst_val = content
+                break
+        if not human_val or not asst_val:
+            continue
+        if len(asst_val) < 20 or len(asst_val) > 1200:
+            continue
+        samples.append({
+            "conversations": [
+                {"from": sys_role, "value": system_val},
+                {"from": user_role, "value": human_val},
+                {"from": asst_role, "value": asst_val},
+            ],
+            "_meta": {
+                "id": "",
+                "source": f"hf_{cfg.repo.split('/')[-1].lower()}",
+                "source_model": cfg.repo,
+                "category": "",
+            },
+        })
+    return samples
+
+def load_hf_dataset(cfg: HFDatasetLoader, theme: Theme) -> list[dict]:
+    fmt = cfg.format
+    rows = _load_rows(cfg.repo, cfg.split, cfg.max_samples, cfg.local_file)
+    if fmt == "auto":
+        fmt = _detect_format(rows[:5] if rows else [])
+    if fmt == "sharegpt":
+        return _load_sharegpt(rows, cfg, theme)
+    if fmt == "alpaca":
+        return _load_alpaca(rows, cfg, theme)
+    if fmt == "chatml":
+        return _load_chatml(rows, cfg, theme)
+    print(f"  [warn] Unknown format '{fmt}' for {cfg.repo} — skipping")
+    return []
+
 
 # ---------------------------------------------------------------------------
 # Synthetic sample → conversation
@@ -74,101 +275,7 @@ def to_conversation(sample: dict, theme: Theme) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# HuggingFace dataset loaders
-# ---------------------------------------------------------------------------
 
-def load_hf_generic_sharegpt(repo: str, split: str, max_samples: int,
-                              local_file: str | None, theme: Theme) -> list[dict]:
-    """
-    Generic loader for datasets already in ShareGPT / conversations format.
-    Falls back to local file if specified (avoids HF API for large datasets).
-    """
-    ds_cfg    = theme.cfg.get("dataset", {})
-    out_cfg   = theme.cfg.get("output", {})
-    sys_role  = out_cfg.get("system_role", "system")
-    user_role = out_cfg.get("user_role", "human")
-    asst_role = out_cfg.get("assistant_role", "gpt")
-
-    system_prompt = theme.prompt(
-        ds_cfg.get("system_prompt", "prompts/system_prompt")
-        .replace("prompts/", "").replace(".txt", "")
-    )
-
-    rows: list[dict] = []
-
-    if local_file and Path(local_file).exists():
-        print(f"  Loading {repo} from local file {local_file}...")
-        with open(local_file) as f:
-            for line in f:
-                if len(rows) >= max_samples:
-                    break
-                try:
-                    rows.append(json.loads(line))
-                except Exception:
-                    continue
-    else:
-        print(f"  Downloading {repo} from HuggingFace...")
-        from datasets import load_dataset
-        ds = load_dataset(repo, split=split, trust_remote_code=True)
-        rows = list(ds)
-
-    samples = []
-    for row in rows:
-        if len(samples) >= max_samples:
-            break
-
-        # Support both "conversations" key (ShareGPT) and "messages" key (ChatML)
-        convos = row.get("conversations") or row.get("messages", [])
-        if len(convos) < 2:
-            continue
-
-        # Extract system + first human/assistant pair
-        system_val = system_prompt
-        human_val  = None
-        asst_val   = None
-
-        for turn in convos:
-            role = turn.get("from") or turn.get("role", "")
-            val  = (turn.get("value") or turn.get("content", "")).strip()
-
-            if role in ("system",) and not human_val:
-                if any(kw in val.lower() for kw in ["character", "roleplay", "persona",
-                                                      "analyst", "assistant", "npc"]):
-                    system_val = val
-
-            elif role in ("human", "user") and human_val is None:
-                # Handle PIPPA-style system packed into first user message
-                if val.startswith("system") and "\n" in val:
-                    parts = val.split("\n", 1)
-                    system_val = parts[0].replace("system", "").strip() or system_val
-                    human_val  = parts[1].strip()
-                else:
-                    human_val = val
-
-            elif role in ("gpt", "assistant") and human_val is not None:
-                asst_val = val
-                break
-
-        if not human_val or not asst_val:
-            continue
-        if len(asst_val) < 20 or len(asst_val) > 1200:
-            continue
-
-        samples.append({
-            "conversations": [
-                {"from": sys_role,  "value": system_val},
-                {"from": user_role, "value": human_val},
-                {"from": asst_role, "value": asst_val},
-            ],
-            "_meta": {
-                "id": "", "source": f"hf_{repo.split('/')[-1].lower()}",
-                "source_model": repo, "category": "",
-            },
-        })
-
-    print(f"    Loaded {len(samples)} samples from {repo}")
-    return samples
 
 
 def load_hf_datasets(hf_cfgs: list[dict], hf_target: int,
@@ -192,7 +299,17 @@ def load_hf_datasets(hf_cfgs: list[dict], hf_target: int,
         local_file = ds_cfg.get("local_file")
         quota      = int(hf_budget * weight / total_weight)
 
-        samples = load_hf_generic_sharegpt(repo, split, max_samp, local_file, theme)
+        loader_cfg = HFDatasetLoader(
+            repo=repo,
+            split=split,
+            max_samples=max_samp,
+            weight=weight,
+            filter=ds_cfg.get("filter", {}),
+            column_map=ds_cfg.get("column_map", {}),
+            format=ds_cfg.get("format", "auto"),
+            local_file=local_file,
+        )
+        samples = load_hf_dataset(loader_cfg, theme)
         random.shuffle(samples)
         samples = samples[:quota]
         print(f"    Using {len(samples)} from {repo} (quota: {quota})")

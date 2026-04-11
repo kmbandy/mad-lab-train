@@ -104,6 +104,9 @@ hf_datasets:
     local_file: null        # set to local path to skip HF download
     max_samples: 800
     weight: 0.6
+    format: sharegpt
+    column_map:
+      conversations: conversations
     filter:
       # Only keep samples that look like roleplay/character dialogue
       min_turns: 2
@@ -114,6 +117,9 @@ hf_datasets:
     local_file: null
     max_samples: 500
     weight: 0.4
+    format: sharegpt
+    column_map:
+      conversations: conversations
     filter:
       min_turns: 2
       require_system: false
