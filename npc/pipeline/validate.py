@@ -20,6 +20,29 @@ import json
 import re
 import sys
 import time
+
+# -------------------------------------------------
+# Retry helper for synchronous OpenAI calls
+# -------------------------------------------------
+
+def _with_retry_sync(fn, max_retries: int = 3, base_delay: float = 1.0):
+    """Retry a synchronous function with exponential backoff.
+
+    fn: a zero‑argument callable to execute.
+    max_retries: number of attempts (including the first).
+    base_delay: initial backoff in seconds; doubles each retry.
+    """
+    for attempt in range(max_retries):
+        try:
+            return fn()
+        except Exception as e:
+            if attempt == max_retries - 1:
+                print(f"  [error] validate call failed: {e}", file=sys.stderr)
+                return None
+            delay = base_delay * (2 ** attempt)
+            print(f"  [retry {attempt+1}/{max_retries}] {e} — retrying in {delay:.1f}s", file=sys.stderr)
+            time.sleep(delay)
+
 from pathlib import Path
 from typing import Optional
 
@@ -64,7 +87,7 @@ def call_model(
     prompt: str,
     max_tokens: int = 80,
 ) -> Optional[str]:
-    try:
+    def _call():
         resp = client.chat.completions.create(
             model=model,
             messages=[
@@ -76,9 +99,8 @@ def call_model(
         )
         content = resp.choices[0].message.content
         return content.strip() if content else None
-    except Exception as e:
-        print(f"  [error] model call failed: {e}", file=sys.stderr)
-        return None
+
+    return _with_retry_sync(_call)
 
 
 # ---------------------------------------------------------------------------

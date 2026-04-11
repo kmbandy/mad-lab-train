@@ -18,6 +18,29 @@ import json
 import random
 import re
 import sys
+
+# -------------------------------------------------
+# Retry helper for async OpenAI calls
+# -------------------------------------------------
+
+async def _with_retry(coro_fn, max_retries: int = 3, base_delay: float = 1.0):
+    """Retry an async coroutine with exponential backoff.
+
+    coro_fn: a zero‑argument coroutine function to execute.
+    max_retries: number of attempts (including the first).
+    base_delay: initial backoff in seconds; doubles each retry.
+    """
+    for attempt in range(max_retries):
+        try:
+            return await coro_fn()
+        except Exception as e:
+            if attempt == max_retries - 1:
+                print(f"  [error] API call failed after {max_retries} attempts: {e}", file=sys.stderr)
+                return None
+            delay = base_delay * (2 ** attempt)
+            print(f"  [retry {attempt+1}/{max_retries}] {e} — retrying in {delay:.1f}s", file=sys.stderr)
+            await asyncio.sleep(delay)
+
 from pathlib import Path
 from typing import Optional
 
@@ -187,7 +210,7 @@ async def generate_one(
     no_think: bool,
     semaphore: asyncio.Semaphore,
 ) -> Optional[str]:
-    try:
+    async def _call():
         async with semaphore:
             resp = await client.chat.completions.create(
                 model=model_id,
@@ -204,9 +227,8 @@ async def generate_one(
         if no_think:
             content = re.sub(r".*?</think>", "", content, flags=re.DOTALL | re.IGNORECASE).strip()
         return content if content else None
-    except Exception as e:
-        print(f"  [error] generation failed: {e}", file=sys.stderr)
-        return None
+
+    return await _with_retry(_call)
 
 
 def validate_output(text: str, theme: Theme) -> bool:
