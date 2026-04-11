@@ -20,3 +20,4 @@ datasets/
 adapter_model/
 checkpoint-*/
 runs/
+.gitnexus
