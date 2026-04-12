@@ -7,6 +7,7 @@ S3_MOUNT_POINT="$HOME/s3/mad-lab-files"
 JOBS_DIR="$S3_MOUNT_POINT/quant-jobs"
 OUTPUT_DIR="$S3_MOUNT_POINT/quant-output"
 LLAMA_CPP_REPO="https://github.com/kmbandy/llama.cpp"
+MOUNTPOINT_S3_VERSION="1.22.2"
 
 # --- HELPERS ---
 
@@ -20,7 +21,6 @@ ensure_pyyaml() {
 parse_yaml() {
     python3 - <<EOF
 import yaml
-import sys
 
 with open('quant.yaml', 'r') as f:
     config = yaml.safe_load(f)
@@ -36,14 +36,12 @@ EOF
 }
 
 setup_s3_mount() {
-    echo "[0/11] Setting up S3 mount..."
-    if ! command -v mount-s3 &> /dev/null; then
-        echo "  Installing mountpoint-s3..."
-        wget -q https://s3.amazonaws.com/mountpoint-s3-release/latest/x86_64/mount-s3.deb
+    if ! command -v mount-s3 &>/dev/null; then
+        echo "  Installing mountpoint-s3 ${MOUNTPOINT_S3_VERSION}..."
+        wget -q "https://s3.amazonaws.com/mountpoint-s3-release/${MOUNTPOINT_S3_VERSION}/x86_64/mount-s3.deb"
         sudo apt-get install -y ./mount-s3.deb -qq
         rm mount-s3.deb
     fi
-
     mkdir -p "$S3_MOUNT_POINT"
     if ! mountpoint -q "$S3_MOUNT_POINT"; then
         echo "  Mounting s3://$S3_FILES_BUCKET..."
@@ -54,18 +52,16 @@ setup_s3_mount() {
 # --- MODE: --package ---
 
 mode_package() {
-    echo "[1/5] Reading and validating quant.yaml..."
-    
+    echo "[1/6] Reading and validating quant.yaml..."
+
     if [ ! -f "quant.yaml" ]; then
         echo "FAIL: quant.yaml not found"
         exit 1
     fi
 
     ensure_pyyaml
-    # Source variables from yaml
     eval $(parse_yaml)
 
-    # Validate model_dir
     if [ -d "$CONFIG_MODEL_DIR" ] && ls "$CONFIG_MODEL_DIR"/*.safetensors >/dev/null 2>&1; then
         echo "PASS: model_dir '$CONFIG_MODEL_DIR' exists and contains .safetensors files"
     else
@@ -73,7 +69,6 @@ mode_package() {
         exit 1
     fi
 
-    # Validate imatrix
     if [ "$CONFIG_IMATRIX" = "true" ]; then
         if [ -f "./imatrix/calibration.txt" ]; then
             echo "PASS: imatrix/calibration.txt exists"
@@ -83,7 +78,7 @@ mode_package() {
         fi
     fi
 
-    echo "[2/5] Creating staging directory..."
+    echo "[2/6] Creating staging directory..."
     STAGING_DIR="quant-job-$CONFIG_NAME"
     rm -rf "$STAGING_DIR"
     mkdir -p "$STAGING_DIR"
@@ -95,18 +90,28 @@ mode_package() {
         cp -r imatrix "$STAGING_DIR/"
     fi
 
-    echo "[3/5] Creating tarball (scripts + calibration only, no model)..."
+    echo "[3/6] Pre-downloading Python wheels..."
+    mkdir -p "$STAGING_DIR/wheels"
+    if pip download -q -d "$STAGING_DIR/wheels/" huggingface-hub gguf pyyaml 2>/dev/null; then
+        echo "  Bundled $(ls "$STAGING_DIR/wheels/" | wc -l) wheel packages"
+    else
+        echo "  WARNING: wheel pre-download failed — EC2 will install from PyPI"
+        rm -rf "$STAGING_DIR/wheels"
+    fi
+
+    echo "[4/6] Creating tarball..."
     TARBALL="$STAGING_DIR.tar.gz"
     tar -czf "$TARBALL" "$STAGING_DIR"
     du -sh "$TARBALL"
 
-    echo "[4/5] Staging to S3..."
+    echo "[5/6] Staging to S3..."
     mkdir -p "$JOBS_DIR"
+    rm -f "$JOBS_DIR/$TARBALL" "$JOBS_DIR/quant.sh"
     cp "$TARBALL" "$JOBS_DIR/"
+    cp "$0" "$JOBS_DIR/quant.sh"  # standalone copy for user-data bootstrap
 
-    # Copy model to S3 models dir so EC2 can pull it
     S3_MODEL_DIR="$S3_MOUNT_POINT/models/$CONFIG_NAME"
-    if [ ! -d "$S3_MODEL_DIR" ]; then
+    if [ ! -d "$S3_MODEL_DIR" ] || [ -z "$(ls -A "$S3_MODEL_DIR" 2>/dev/null)" ]; then
         echo "  Uploading model to S3 (this may take a while)..."
         mkdir -p "$S3_MODEL_DIR"
         rsync -a --no-perms --no-owner --no-group \
@@ -117,11 +122,16 @@ mode_package() {
         echo "  Model already in S3, skipping upload"
     fi
 
-    echo "Job staged. On EC2 run: bash quant.sh --run $CONFIG_NAME"
-
-    echo "[5/5] Cleaning up local staging dir..."
+    echo "[6/6] Cleaning up..."
     rm -rf "$STAGING_DIR"
     rm -f "$TARBALL"
+
+    echo ""
+    echo "Job staged. On EC2 run:"
+    echo "  bash quant.sh --run $CONFIG_NAME"
+    echo ""
+    echo "Or get user-data bootstrap:"
+    echo "  bash quant.sh --userdata $CONFIG_NAME"
 }
 
 # --- MODE: --run ---
@@ -130,40 +140,55 @@ mode_run() {
     JOB_NAME=$1
     TARBALL="quant-job-$JOB_NAME.tar.gz"
 
+    echo "[0/11] Setting up S3 mount..."
     setup_s3_mount
 
-    echo "[1/11] Unpacking..."
+    echo "[1/11] Unpacking job..."
     cp "$JOBS_DIR/$TARBALL" .
     tar -xzf "$TARBALL"
     cd "quant-job-$JOB_NAME"
 
-    # Load config from unpacked dir
     ensure_pyyaml
     eval $(parse_yaml)
 
     echo "[1b/11] Pulling model from S3..."
-    S3_MODEL_DIR="$S3_MOUNT_POINT/models/$CONFIG_NAME"
+    S3_MODEL_DIR="$S3_MOUNT_POINT/models/$JOB_NAME"
     if [ ! -d "$S3_MODEL_DIR" ]; then
         echo "ERROR: Model not found in S3 at $S3_MODEL_DIR"
         exit 1
     fi
-    cp -r "$S3_MODEL_DIR" model/
+    mkdir -p model
+    cp -r "$S3_MODEL_DIR/." model/
     echo "  Model ready ($(du -sh model/ | cut -f1))"
 
     echo "[2/11] Installing system deps..."
-    sudo apt-get update -qq
-    sudo apt-get install -y -qq git cmake build-essential python3-pip python3-venv
+    MISSING_PKGS=()
+    command -v git    >/dev/null || MISSING_PKGS+=(git)
+    command -v cmake  >/dev/null || MISSING_PKGS+=(cmake)
+    command -v rsync  >/dev/null || MISSING_PKGS+=(rsync)
+    dpkg -s build-essential &>/dev/null || MISSING_PKGS+=(build-essential)
+    dpkg -s python3-venv    &>/dev/null || MISSING_PKGS+=(python3-venv)
 
-    if [ "$CONFIG_GPU" = "true" ]; then
-        if ! command -v nvcc &> /dev/null; then
-            sudo apt-get install -y -qq nvidia-cuda-toolkit
-        fi
+    if [ ${#MISSING_PKGS[@]} -gt 0 ]; then
+        echo "  Installing: ${MISSING_PKGS[*]}"
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq --no-install-recommends "${MISSING_PKGS[@]}"
+    else
+        echo "  All system deps present, skipping apt"
     fi
 
     echo "[3/11] Setting up Python venv..."
     python3 -m venv /tmp/quant-venv
     source /tmp/quant-venv/bin/activate
-    pip install -q huggingface-hub gguf pyyaml
+
+    if [ -d "wheels" ] && [ "$(ls -A wheels/ 2>/dev/null)" ]; then
+        echo "  Installing from bundled wheels..."
+        pip install -q --no-index --find-links wheels/ huggingface-hub gguf pyyaml 2>/dev/null || \
+            pip install -q huggingface-hub gguf pyyaml
+    else
+        echo "  Installing from PyPI..."
+        pip install -q huggingface-hub gguf pyyaml
+    fi
 
     echo "[4/11] Mounting NVMe instance storage..."
     NVME_DEV=$(lsblk -dpno NAME,TYPE | awk '$2=="disk" {print $1}' | grep nvme | head -1)
@@ -181,21 +206,50 @@ mode_run() {
     fi
     sudo chmod 777 "$WORK_DIR"
 
-    echo "[5/11] Building llama.cpp..."
+    echo "[5/11] Setting up llama.cpp..."
+    GPU_ARCH=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '.' || echo "cpu")
+    CUDA_VER=$(nvcc --version 2>/dev/null | grep "release" | sed 's/.*release \([0-9]*\.[0-9]*\).*/\1/' | tr '.' '_' || echo "none")
+    CACHE_KEY="sm${GPU_ARCH}_cuda${CUDA_VER}"
+    LLAMA_BIN_CACHE="$S3_MOUNT_POINT/llama-builds/${CACHE_KEY}"
+
+    echo "  GPU arch: sm${GPU_ARCH}  CUDA: ${CUDA_VER}  cache key: ${CACHE_KEY}"
+
+    # Always clone for Python scripts (fast, depth=1)
     if [ ! -d "$WORK_DIR/llama.cpp" ]; then
+        echo "  Cloning llama.cpp..."
         git clone --depth=1 "$LLAMA_CPP_REPO" "$WORK_DIR/llama.cpp"
     fi
-    cd "$WORK_DIR/llama.cpp"
-    
-    if [ "$CONFIG_GPU" = "true" ]; then
-        cmake -B build -DGGML_CUDA=ON -DLLAMA_BUILD_TESTS=OFF \
-              -DLLAMA_BUILD_EXAMPLES=OFF -DCMAKE_BUILD_TYPE=Release
+    mkdir -p "$WORK_DIR/llama.cpp/build/bin"
+
+    if [ -f "$LLAMA_BIN_CACHE/llama-quantize" ] && [ -f "$LLAMA_BIN_CACHE/llama-imatrix" ]; then
+        echo "  Cache hit — restoring binaries..."
+        cp "$LLAMA_BIN_CACHE/llama-quantize" "$WORK_DIR/llama.cpp/build/bin/"
+        cp "$LLAMA_BIN_CACHE/llama-imatrix"  "$WORK_DIR/llama.cpp/build/bin/"
+        chmod +x "$WORK_DIR/llama.cpp/build/bin/llama-quantize"
+        chmod +x "$WORK_DIR/llama.cpp/build/bin/llama-imatrix"
+        echo "  Skipping build — using cached binaries"
     else
-        cmake -B build -DGGML_NATIVE=ON -DLLAMA_BUILD_TESTS=OFF \
-              -DLLAMA_BUILD_EXAMPLES=OFF -DCMAKE_BUILD_TYPE=Release
+        echo "  Cache miss — building llama.cpp (this takes 15-20 min)..."
+        cd "$WORK_DIR/llama.cpp"
+        START_BUILD=$(date +%s)
+        if [ "$CONFIG_GPU" = "true" ]; then
+            cmake -B build -DGGML_CUDA=ON -DLLAMA_BUILD_TESTS=OFF \
+                  -DLLAMA_BUILD_EXAMPLES=OFF -DCMAKE_BUILD_TYPE=Release
+        else
+            cmake -B build -DGGML_NATIVE=ON -DLLAMA_BUILD_TESTS=OFF \
+                  -DLLAMA_BUILD_EXAMPLES=OFF -DCMAKE_BUILD_TYPE=Release
+        fi
+        cmake --build build --target llama-quantize llama-imatrix -j "$(nproc)"
+        END_BUILD=$(date +%s)
+        echo "  Build time: $((END_BUILD - START_BUILD))s"
+
+        echo "  Caching binaries → S3 (${CACHE_KEY})..."
+        mkdir -p "$LLAMA_BIN_CACHE"
+        cp build/bin/llama-quantize "$LLAMA_BIN_CACHE/"
+        cp build/bin/llama-imatrix  "$LLAMA_BIN_CACHE/"
+        echo "  Cached — future runs will skip the build"
+        cd "$OLDPWD"
     fi
-    cmake --build build --target llama-quantize llama-imatrix -j "$(nproc)"
-    cd "$OLDPWD"
 
     echo "[6/11] Converting to F16 GGUF..."
     START_CONVERT=$(date +%s)
@@ -205,8 +259,7 @@ mode_run() {
         --outtype f16 \
         --outfile "$F16_OUT"
     END_CONVERT=$(date +%s)
-    echo "F16 Size: $(du -sh "$F16_OUT" | cut -f1)"
-    echo "Convert time: $((END_CONVERT - START_CONVERT))s"
+    echo "  F16 size: $(du -sh "$F16_OUT" | cut -f1)  time: $((END_CONVERT - START_CONVERT))s"
 
     IMATRIX_FILE=""
     if [ "$CONFIG_IMATRIX" = "true" ]; then
@@ -219,7 +272,7 @@ mode_run() {
             -o "$IMATRIX_FILE" \
             --chunks 128
         END_IMATRIX=$(date +%s)
-        echo "Imatrix time: $((END_IMATRIX - START_IMATRIX))s"
+        echo "  Imatrix time: $((END_IMATRIX - START_IMATRIX))s"
     else
         echo "[7/11] Skipping imatrix (not requested)"
     fi
@@ -230,7 +283,7 @@ mode_run() {
         echo "  Quantizing to $QUANT..."
         START_Q=$(date +%s)
         OUT_FILE="$WORK_DIR/$CONFIG_OUTPUT_PREFIX-$QUANT.gguf"
-        
+
         IMATRIX_ARG=""
         if [ "$CONFIG_IMATRIX" = "true" ]; then
             IMATRIX_ARG="--imatrix $IMATRIX_FILE"
@@ -242,34 +295,62 @@ mode_run() {
             "$OUT_FILE" \
             "$QUANT" \
             "$(nproc)"
-        
+
         END_Q=$(date +%s)
         ELAPSED=$((END_Q - START_Q))
         SIZE=$(du -sh "$OUT_FILE" | cut -f1)
-        echo "  Done: $SIZE, ${ELAPSED}s"
+        echo "  Done: $SIZE in ${ELAPSED}s"
         RESULTS+="$QUANT | $SIZE | ${ELAPSED}s\n"
     done
 
     echo "[9/11] Cleanup..."
     rm -f "$F16_OUT"
-    if [ -n "$IMATRIX_FILE" ]; then
-        rm -f "$IMATRIX_FILE"
-    fi
+    [ -n "$IMATRIX_FILE" ] && rm -f "$IMATRIX_FILE"
 
     echo "[10/11] Writing output to S3..."
     mkdir -p "$OUTPUT_DIR"
     for QUANT in $CONFIG_QUANTS; do
         OUT_FILE="$WORK_DIR/$CONFIG_OUTPUT_PREFIX-$QUANT.gguf"
         cp "$OUT_FILE" "$OUTPUT_DIR/"
-        echo "Uploaded: $CONFIG_OUTPUT_PREFIX-$QUANT.gguf ($(du -sh "$OUT_FILE" | cut -f1))"
+        echo "  Uploaded: $CONFIG_OUTPUT_PREFIX-$QUANT.gguf ($(du -sh "$OUT_FILE" | cut -f1))"
     done
 
     echo "[11/11] Summary"
     echo "----------------------------------------"
-    echo -e "quant type | size | time"
-    echo -e "$RESULTS"
+    printf "%-12s | %-8s | %s\n" "quant" "size" "time"
     echo "----------------------------------------"
+    echo -e "$RESULTS"
     echo "All done. Terminate this instance now."
+}
+
+# --- MODE: --userdata ---
+
+mode_userdata() {
+    JOB_NAME=${1:-"<job_name>"}
+    cat <<USERDATA
+#!/bin/bash
+# EC2 user-data bootstrap for quant job: $JOB_NAME
+# Paste into "User data" when launching the spot instance.
+# Requires: IAM role with s3:GetObject/PutObject/ListBucket on $S3_FILES_BUCKET
+
+set -euo pipefail
+LOG=/home/ubuntu/quant.log
+echo "=== quant bootstrap \$(date) ===" >> \$LOG
+
+# Install mountpoint-s3 if needed
+if ! command -v mount-s3 &>/dev/null; then
+    wget -q https://s3.amazonaws.com/mountpoint-s3-release/${MOUNTPOINT_S3_VERSION}/x86_64/mount-s3.deb
+    apt-get install -y ./mount-s3.deb -qq
+    rm mount-s3.deb
+fi
+
+# Pull quant.sh from S3 and run as ubuntu
+cd /home/ubuntu
+aws s3 cp s3://${S3_FILES_BUCKET}/quant-jobs/quant.sh ./quant.sh
+chmod +x quant.sh
+chown ubuntu:ubuntu quant.sh
+sudo -u ubuntu -H bash /home/ubuntu/quant.sh --run $JOB_NAME >> \$LOG 2>&1
+USERDATA
 }
 
 # --- MAIN ---
@@ -278,6 +359,7 @@ if [ $# -lt 1 ]; then
     echo "Usage:"
     echo "  $0 --package"
     echo "  $0 --run <job_name>"
+    echo "  $0 --userdata <job_name>   # print EC2 user-data bootstrap script"
     exit 1
 fi
 
@@ -291,6 +373,13 @@ case "$1" in
             exit 1
         fi
         mode_run "$2"
+        ;;
+    --userdata)
+        if [ -z "${2:-}" ]; then
+            echo "Error: --userdata requires a job name"
+            exit 1
+        fi
+        mode_userdata "$2"
         ;;
     *)
         echo "Unknown option: $1"
