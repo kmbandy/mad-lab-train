@@ -1,0 +1,9 @@
+name: deepseek-coder-v2-lite
+model_dir: ./model          # local path to HF snapshot
+quants:
+  - Q6_K
+  - Q5_K_M
+  - Q4_K_M
+imatrix: true               # run llama-imatrix before quantizing
+output_prefix: deepseek-coder-v2-lite
+gpu: true                   # build with CUDA

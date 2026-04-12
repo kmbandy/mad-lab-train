@@ -1,0 +1,149 @@
+  PROMPT:
+
+  You are writing a production bash script called `quant.sh`.
+  Read every requirement carefully — implement exactly what is specified,
+  nothing more, nothing less.
+
+  ---
+
+  ## CONTEXT
+
+  This script runs a GGUF quantization pipeline in two modes:
+  - `--package`: runs on a local Linux machine (mad-lab), bundles a job for EC2
+  - `--run`: runs on an EC2 instance, executes the quantization job end to end
+
+  S3 Files bucket name: `mad-lab-files`
+  S3 mount point (same on both mad-lab and EC2): `~/s3/mad-lab-files`
+  Jobs directory in S3: `~/s3/mad-lab-files/quant-jobs/`
+  Output directory in S3: `~/s3/mad-lab-files/quant-output/`
+
+  llama.cpp GitHub repo to clone: `https://github.com/kmbandy/llama.cpp`
+
+  ---
+
+  ## CONFIG FILE FORMAT
+
+  The script reads `quant.yaml` from the current directory. Parse it using Python
+  (not yq — yq may not be installed). Here is the exact schema:
+
+  ```yaml
+  name: deepseek-coder-v2-lite
+  model_dir: ./model          # path to HF snapshot (safetensors + config.json + tokenizer)
+  quants:
+    - Q6_K
+    - Q5_K_M
+    - Q4_K_M
+  imatrix: true               # if true, run llama-imatrix before quantizing
+  output_prefix: deepseek-coder-v2-lite
+  gpu: true                   # if true, build llama.cpp with CUDA; if false, CPU-only
+
+  ---
+  MODE: --package (runs on mad-lab)
+
+  Steps in order:
+
+  1. Read and validate quant.yaml:
+    - Verify model_dir exists and contains at least one .safetensors file
+    - If imatrix: true, verify ./imatrix/calibration.txt exists
+    - Print each validation step with PASS/FAIL
+  2. Create a staging directory: quant-job-<name>/
+    - Copy quant.yaml into it
+    - Copy quant.sh (the script itself, i.e. $0) into it
+    - Copy model/ directory into it (preserve structure)
+    - If imatrix: true, copy imatrix/ directory into it
+  3. Create tarball:
+  tar -czf quant-job-<name>.tar.gz quant-job-<name>/
+  Print the size with du -sh.
+  4. Copy tarball to S3 mount:
+  cp quant-job-<name>.tar.gz ~/s3/mad-lab-files/quant-jobs/
+  Print: "Job staged. On EC2 run: bash quant.sh --run quant-job-"
+  5. Clean up local staging dir (keep the tarball).
+
+  ---
+  MODE: --run (runs on EC2)
+
+  Takes one argument: the job name (not the tarball filename, just the name).
+
+  Steps in order:
+
+  1. Unpack
+  Pull tarball from S3 mount:
+  cp ~/s3/mad-lab-files/quant-jobs/quant-job-<name>.tar.gz .
+  Extract: tar -xzf quant-job-<name>.tar.gz
+  cd into quant-job-<name>/
+  2. Install system deps
+  sudo apt-get update -qq
+  sudo apt-get install -y -qq git cmake build-essential python3-pip python3-venv
+  2. If gpu: true, also install: nvidia-cuda-toolkit (skip if nvcc already in PATH)
+  3. Python venv
+  python3 -m venv /tmp/quant-venv
+  source /tmp/quant-venv/bin/activate
+  pip install -q huggingface-hub gguf
+  4. Mount NVMe instance storage (same logic as reference script below)
+  Device: first nvme disk from lsblk -dpno NAME,TYPE
+  Format as ext4 if not already formatted
+  Mount at /mnt/nvme
+  Set WORK_DIR=/mnt/nvme
+  5. Build llama.cpp
+  Clone to $WORK_DIR/llama.cpp (skip if already exists)
+  If gpu: true:
+  cmake -B build -DGGML_CUDA=ON -DLLAMA_BUILD_TESTS=OFF \
+        -DLLAMA_BUILD_EXAMPLES=OFF -DCMAKE_BUILD_TYPE=Release
+  5. If gpu: false:
+  cmake -B build -DGGML_NATIVE=ON -DLLAMA_BUILD_TESTS=OFF \
+        -DLLAMA_BUILD_EXAMPLES=OFF -DCMAKE_BUILD_TYPE=Release
+  5. Build targets: llama-quantize llama-imatrix
+  Use -j $(nproc)
+  6. Convert to F16 GGUF
+  python3 $WORK_DIR/llama.cpp/convert_hf_to_gguf.py \
+      model/ \
+      --outtype f16 \
+      --outfile $WORK_DIR/<output_prefix>-f16.gguf
+  6. Print size.
+  7. Generate imatrix (only if imatrix: true)
+  $WORK_DIR/llama.cpp/build/bin/llama-imatrix \
+      -m $WORK_DIR/<output_prefix>-f16.gguf \
+      -f imatrix/calibration.txt \
+      -o $WORK_DIR/<output_prefix>.imatrix \
+      --chunks 128
+  7. Print time taken.
+  8. Quantize loop — for each entry in quants list:
+  $WORK_DIR/llama.cpp/build/bin/llama-quantize \
+      [--imatrix $WORK_DIR/<output_prefix>.imatrix  ← only if imatrix: true] \
+      $WORK_DIR/<output_prefix>-f16.gguf \
+      $WORK_DIR/<output_prefix>-<QUANT>.gguf \
+      <QUANT> \
+      $(nproc)
+  8. Print size and time for each quant.
+  9. Cleanup
+  Delete the F16 GGUF: rm -f $WORK_DIR/<output_prefix>-f16.gguf
+  If imatrix: true, delete the .imatrix file too.
+  10. Write output to S3
+  For each output GGUF:
+  cp $WORK_DIR/<output_prefix>-<QUANT>.gguf \
+     ~/s3/mad-lab-files/quant-output/
+  10. Print: "Uploaded:  ()"
+  11. Summary
+  Print a table: quant type | size | time
+  Print: "All done. Terminate this instance now."
+
+  ---
+  REQUIREMENTS
+
+  - set -euo pipefail at the top
+  - Parse quant.yaml with an inline Python heredoc (not yq)
+  - Every major step gets a numbered header: echo "[3/11] Building llama.cpp..."
+  - Time each major step (F16 convert, imatrix, each quant) using date +%s
+  and print elapsed seconds
+  - No hardcoded model names anywhere — everything comes from quant.yaml
+  - The script must be self-contained: no external helper scripts
+
+  ---
+  REFERENCE SCRIPT
+
+  Use this existing script for NVMe mount logic and overall bash style:
+
+  [paste full contents of ec2-tq3-quant.sh here]
+
+  ---
+  Output only the complete quant.sh script. No explanation before or after.
