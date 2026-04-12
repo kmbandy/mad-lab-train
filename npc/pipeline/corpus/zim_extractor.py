@@ -15,6 +15,9 @@ Usage:
     # Skip tag filter (for smaller SE ZIMs like electronics, unix, dsp)
     python3 zim_extractor.py --no-tag-filter electronics.zim output.jsonl
 
+    # Use multiple workers (default: all CPU cores)
+    python3 zim_extractor.py --workers 8 stackoverflow.zim output.jsonl
+
 Output: ShareGPT JSONL, appended across all ZIMs, deduped by content hash.
 """
 
@@ -23,7 +26,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import multiprocessing
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 from bs4 import BeautifulSoup
@@ -163,6 +168,49 @@ def extract_entry(html: str, require_tags: set[str] | None = None) -> dict | Non
     }
 
 
+def _worker_chunk(
+    zim_path: str,
+    entry_ids: list[int],
+    require_tags: list[str] | None,
+    min_score: int,
+    min_ans_score: int,
+) -> list[tuple[str, dict]]:
+    """
+    Worker: process a chunk of entry IDs from a ZIM file.
+    Opens its own Archive instance (not picklable, must be created per-process).
+    Returns list of (content_hash, result) tuples.
+    """
+    from libzim.reader import Archive as _Archive
+    zim = _Archive(zim_path)
+    tags_set = set(require_tags) if require_tags else None
+    results = []
+
+    for i in entry_ids:
+        entry = zim._get_entry_by_id(i)
+        if not entry.path.startswith("a/"):
+            continue
+        try:
+            item = entry.get_item()
+            html = bytes(item.content).decode("utf-8", errors="replace")
+        except Exception:
+            continue
+
+        result = extract_entry(html, require_tags=tags_set)
+        if result is None:
+            continue
+        if result["q_score"] < min_score:
+            continue
+        if result["ans_score"] < min_ans_score:
+            continue
+
+        content_hash = hashlib.md5(
+            result["conversations"][1]["value"].encode()
+        ).hexdigest()
+        results.append((content_hash, result))
+
+    return results
+
+
 def extract_zim(
     zim_path: Path,
     out_file,
@@ -171,6 +219,7 @@ def extract_zim(
     min_score: int = 1,
     min_ans_score: int = 0,
     max_entries: int = 0,
+    workers: int = 1,
 ) -> tuple[int, int]:
     """Extract from a single ZIM, write to open file handle. Returns (extracted, examined)."""
     zim = Archive(zim_path)
@@ -178,53 +227,83 @@ def extract_zim(
     source_name = zim_path.stem.split("_en_")[0]  # e.g. "stackoverflow.com"
     require_tags = GPU_TAGS if tag_filter else None
 
-    print(f"\n  {source_name}: {total:,} entries", flush=True)
+    print(f"\n  {source_name}: {total:,} entries  workers={workers}", flush=True)
 
     extracted = 0
-    examined = 0
 
-    for i in range(total):
-        entry = zim._get_entry_by_id(i)
-        if not entry.path.startswith("a/"):
-            continue
+    if workers > 1:
+        # Split entry ID space into chunks — each worker opens its own Archive
+        all_ids = list(range(total))
+        chunk_size = max(1, total // workers)
+        chunks = [all_ids[i:i + chunk_size] for i in range(0, total, chunk_size)]
+        require_tags_list = list(require_tags) if require_tags else None
 
-        examined += 1
-        try:
-            item = entry.get_item()
-            html = bytes(item.content).decode("utf-8", errors="replace")
-        except Exception:
-            continue
+        chunk_args = [
+            (str(zim_path), chunk, require_tags_list, min_score, min_ans_score)
+            for chunk in chunks
+        ]
 
-        result = extract_entry(html, require_tags=require_tags)
-        if result is None:
-            continue
+        completed_chunks = 0
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(_worker_chunk, *args): i for i, args in enumerate(chunk_args)}
+            for future in as_completed(futures):
+                chunk_results = future.result()
+                for content_hash, result in chunk_results:
+                    if content_hash in seen_hashes:
+                        continue
+                    seen_hashes.add(content_hash)
+                    result["source"] = source_name
+                    out_file.write(json.dumps(result) + "\n")
+                    extracted += 1
+                    if max_entries and extracted >= max_entries:
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        break
 
-        if result["q_score"] < min_score:
-            continue
-        if result["ans_score"] < min_ans_score:
-            continue
+                completed_chunks += 1
+                pct = completed_chunks / len(chunks) * 100
+                print(f"    [{pct:.1f}%] chunks={completed_chunks}/{len(chunks)} extracted={extracted:,}", flush=True)
 
-        # Dedup by answer content hash
-        content_hash = hashlib.md5(
-            result["conversations"][1]["value"].encode()
-        ).hexdigest()
-        if content_hash in seen_hashes:
-            continue
-        seen_hashes.add(content_hash)
+    else:
+        # Single-threaded path
+        for i in range(total):
+            entry = zim._get_entry_by_id(i)
+            if not entry.path.startswith("a/"):
+                continue
 
-        result["source"] = source_name
-        out_file.write(json.dumps(result) + "\n")
-        extracted += 1
+            try:
+                item = entry.get_item()
+                html = bytes(item.content).decode("utf-8", errors="replace")
+            except Exception:
+                continue
 
-        if extracted % 500 == 0:
-            pct = i / total * 100
-            print(f"    [{pct:.1f}%] extracted={extracted:,}", flush=True)
+            result = extract_entry(html, require_tags=require_tags)
+            if result is None:
+                continue
+            if result["q_score"] < min_score:
+                continue
+            if result["ans_score"] < min_ans_score:
+                continue
 
-        if max_entries and extracted >= max_entries:
-            break
+            content_hash = hashlib.md5(
+                result["conversations"][1]["value"].encode()
+            ).hexdigest()
+            if content_hash in seen_hashes:
+                continue
+            seen_hashes.add(content_hash)
 
-    print(f"  Done: {extracted:,} extracted from {examined:,} examined")
-    return extracted, examined
+            result["source"] = source_name
+            out_file.write(json.dumps(result) + "\n")
+            extracted += 1
+
+            if extracted % 500 == 0:
+                pct = i / total * 100
+                print(f"    [{pct:.1f}%] extracted={extracted:,}", flush=True)
+
+            if max_entries and extracted >= max_entries:
+                break
+
+    print(f"  Done: {extracted:,} extracted", flush=True)
+    return extracted, total
 
 
 def main() -> None:
@@ -237,6 +316,8 @@ def main() -> None:
     parser.add_argument("--min-score", type=int, default=1)
     parser.add_argument("--min-ans-score", type=int, default=0)
     parser.add_argument("--max", type=int, default=0, help="Max per ZIM (0=all)")
+    parser.add_argument("--workers", type=int, default=multiprocessing.cpu_count(),
+                        help=f"Parallel workers (default: {multiprocessing.cpu_count()} = all cores)")
     args, extra = parser.parse_known_args()
 
     # parse_known_args captures zim paths that appear after flags like --no-tag-filter
@@ -265,6 +346,7 @@ def main() -> None:
     print(f"Output: {out_path}")
     print(f"Tag filter: {'disabled' if args.no_tag_filter else 'GPU/compute tags'}")
     print(f"ZIMs to process: {len(zim_paths)}")
+    print(f"Workers: {args.workers}")
 
     with open(out_path, "a") as f:
         for zim_path in zim_paths:
@@ -277,6 +359,7 @@ def main() -> None:
                 min_score=args.min_score,
                 min_ans_score=args.min_ans_score,
                 max_entries=args.max,
+                workers=args.workers,
             )
             total_extracted += extracted
 
