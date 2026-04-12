@@ -170,13 +170,14 @@ def extract_entry(html: str, require_tags: set[str] | None = None) -> dict | Non
 
 def _worker_chunk(
     zim_path: str,
-    entry_ids: list[int],
+    start: int,
+    end: int,
     require_tags: list[str] | None,
     min_score: int,
     min_ans_score: int,
 ) -> list[tuple[str, dict]]:
     """
-    Worker: process a chunk of entry IDs from a ZIM file.
+    Worker: process entry IDs [start, end) from a ZIM file.
     Opens its own Archive instance (not picklable, must be created per-process).
     Returns list of (content_hash, result) tuples.
     """
@@ -185,7 +186,7 @@ def _worker_chunk(
     tags_set = set(require_tags) if require_tags else None
     results = []
 
-    for i in entry_ids:
+    for i in range(start, end):
         entry = zim._get_entry_by_id(i)
         if not entry.path.startswith("a/"):
             continue
@@ -232,15 +233,15 @@ def extract_zim(
     extracted = 0
 
     if workers > 1:
-        # Split entry ID space into chunks — each worker opens its own Archive
-        all_ids = list(range(total))
+        # Split entry ID space into chunks — pass (start, end) not ID lists to avoid
+        # materializing 66M integers in memory
         chunk_size = max(1, total // workers)
-        chunks = [all_ids[i:i + chunk_size] for i in range(0, total, chunk_size)]
+        boundaries = [(i, min(i + chunk_size, total)) for i in range(0, total, chunk_size)]
         require_tags_list = list(require_tags) if require_tags else None
 
         chunk_args = [
-            (str(zim_path), chunk, require_tags_list, min_score, min_ans_score)
-            for chunk in chunks
+            (str(zim_path), start, end, require_tags_list, min_score, min_ans_score)
+            for start, end in boundaries
         ]
 
         completed_chunks = 0
@@ -260,8 +261,8 @@ def extract_zim(
                         break
 
                 completed_chunks += 1
-                pct = completed_chunks / len(chunks) * 100
-                print(f"    [{pct:.1f}%] chunks={completed_chunks}/{len(chunks)} extracted={extracted:,}", flush=True)
+                pct = completed_chunks / len(boundaries) * 100
+                print(f"    [{pct:.1f}%] chunks={completed_chunks}/{len(boundaries)} extracted={extracted:,}", flush=True)
 
     else:
         # Single-threaded path
