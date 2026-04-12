@@ -1,0 +1,166 @@
+# GPU Architecture & Kernel Engineering Theme
+# Used by: pipeline/generate.py, pipeline/validate.py, pipeline/dataset.py
+
+name: gpu_architecture
+description: "GPU architecture and kernel engineering expert — deep knowledge of RDNA2/CDNA, ROCm/HIP, wavefronts, MFMA, quantized GEMM, and LLM inference optimization"
+
+# ---------------------------------------------------------------------------
+# Generation models
+# ---------------------------------------------------------------------------
+generators:
+  writer:
+    role: primary
+    prompt_file: prompts/generator_writer.txt
+    temperature: 0.6          # low — technical precision matters
+    max_tokens: 600
+
+  opus:
+    role: secondary
+    prompt_file: prompts/generator_opus.txt
+    temperature: 0.55
+    max_tokens: 1200          # longer for kernel walkthroughs
+    no_think: true
+
+# ---------------------------------------------------------------------------
+# Reviewers
+# ---------------------------------------------------------------------------
+reviewers:
+  writer:
+    prompt_file: prompts/reviewer_writer.txt
+    pass_field: score
+    pass_threshold: null
+
+  qwen:
+    prompt_file: prompts/reviewer_qwen.txt
+    pass_field: score
+    pass_threshold: null
+
+# ---------------------------------------------------------------------------
+# Categories
+# ---------------------------------------------------------------------------
+categories:
+  - name: execution_model
+    description: "Wavefront/warp execution, SIMD lanes, occupancy, register pressure, LDS bank conflicts"
+    weight: 0.25
+
+  - name: memory_hierarchy
+    description: "L0/L1/L2 cache behavior, HBM/GDDR bandwidth, coalescing rules, memory access patterns"
+    weight: 0.25
+
+  - name: kernel_optimization
+    description: "Writing and optimizing HIP/CUDA kernels — tiling, shared memory usage, latency hiding"
+    weight: 0.20
+
+  - name: quantized_inference
+    description: "Quantized GEMM kernels, dequantization fused with multiply, IQK/R4 quant formats, LLM inference bottlenecks"
+    weight: 0.20
+
+  - name: architecture_comparison
+    description: "RDNA2 vs CDNA, wave64 vs wave32, MFMA vs tensor cores, AMD vs NVIDIA architectural trade-offs"
+    weight: 0.10
+
+# ---------------------------------------------------------------------------
+# Lore / context sources
+# ---------------------------------------------------------------------------
+lore:
+  kiwix:
+    enabled: true
+    topics:
+      - "Graphics processing unit"
+      - "CUDA"
+      - "OpenCL"
+      - "General-purpose computing on graphics processing units"
+      - "Matrix multiplication algorithm"
+      - "Single instruction, multiple data"
+      - "Memory bandwidth"
+      - "Cache (computing)"
+      - "Tensor (machine learning)"
+      - "Floating-point arithmetic"
+    max_chars: 1200
+
+# ---------------------------------------------------------------------------
+# HuggingFace dataset mixing
+# ---------------------------------------------------------------------------
+hf_datasets:
+  - repo: "codeparrot/github-code"
+    split: "train"
+    local_file: null
+    max_samples: 800
+    weight: 0.4
+    format: alpaca
+    column_map:
+      human: code
+      assistant: code
+    filter:
+      min_turns: 1
+      require_system: false
+
+  - repo: "open-llm-leaderboard/results"
+    split: "train"
+    local_file: null
+    max_samples: 400
+    weight: 0.3
+    format: alpaca
+    column_map:
+      human: question
+      assistant: response
+    filter:
+      min_turns: 1
+      require_system: false
+
+  - repo: "iamtarun/python_code_instructions_18k_alpaca"
+    split: "train"
+    local_file: null
+    max_samples: 400
+    weight: 0.3
+    format: alpaca
+    column_map:
+      human: instruction
+      assistant: output
+    filter:
+      min_turns: 1
+      require_system: false
+
+# ---------------------------------------------------------------------------
+# Dataset builder config
+# ---------------------------------------------------------------------------
+dataset:
+  system_prompt: prompts/system_prompt.txt
+  human_turn: prompts/human_turn.txt
+  response_field: response
+  generator_keys: [writer, opus]
+
+# ---------------------------------------------------------------------------
+# Fast filter config
+# ---------------------------------------------------------------------------
+fast_filter:
+  system_prompt: fast_filter_system
+  prompt_template: fast_filter_prompt
+  score_field: score
+  max_tokens: 10
+  rate_limit_sleep: 0.2
+
+# ---------------------------------------------------------------------------
+# Cross-review config
+# ---------------------------------------------------------------------------
+cross_review:
+  prompt_template: cross_review_prompt
+  max_tokens: 150
+  rate_limit_sleep: 0.3
+
+# ---------------------------------------------------------------------------
+# Output validation
+# ---------------------------------------------------------------------------
+validation:
+  min_length: 100
+  max_lines: 30
+
+# ---------------------------------------------------------------------------
+# Output format
+# ---------------------------------------------------------------------------
+output:
+  format: sharegpt
+  chat_template: chatml
+  system_role: system
+  user_role: human
+  assistant_role: gpt

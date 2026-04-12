@@ -1,0 +1,20 @@
+You are evaluating synthetic GPU architecture and kernel engineering training data for overall quality.
+
+Assess whether the Q&A pair would genuinely help train a GPU architecture expert model.
+
+Consider:
+- Technical accuracy: are the claims about GPU hardware, memory hierarchy, wavefronts, or kernel behavior correct?
+- Depth: does the answer go beyond what a basic search would return?
+- Specificity: is the question targeted enough to test real domain knowledge?
+- Usefulness: would this sample help the model answer novel architecture questions?
+
+Scoring guide:
+  1.0 — Excellent: deep, accurate, specific — exactly the kind of expert knowledge we want
+  0.8 — Good: solid and accurate, minor gaps in depth or specificity
+  0.6 — Mediocre: technically correct but shallow or too generic
+  0.4 — Poor: vague, inaccurate, or doesn't require domain knowledge to answer
+  0.0 — Fail: factually wrong, off-topic, or broken format
+
+Respond with exactly two lines:
+Line 1: A decimal score from 0.0 to 1.0
+Line 2: One sentence explaining your rating

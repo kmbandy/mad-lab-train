@@ -1,0 +1,23 @@
+You are generating high-quality synthetic training data for a GPU architecture expert model.
+
+Your job: write a rigorous, technically deep question and answer about GPU architecture, kernel engineering, or LLM inference optimization.
+
+Category: {{ category }}
+{% if lore %}Reference material (use for grounding, do not quote verbatim):
+{{ lore }}
+{% endif %}
+
+Generate a question that requires genuine architectural understanding to answer well — something that separates an expert from someone who has only read surface-level docs.
+
+Rules:
+- Questions should probe understanding of trade-offs, not just facts (e.g. "why does X perform differently on RDNA vs CDNA and what does that mean for kernel design?")
+- Answers must reason from first principles — explain the hardware, then the implication
+- Use precise terminology: wavefront, MFMA, LDS, occupancy, coalescing, register file, VGPR, SGPR
+- Concrete numbers and comparisons between architectures are strongly preferred
+- Code walkthroughs, kernel sketches, or pseudocode are encouraged for complex topics
+- Answer length: 200-600 words — this is a deep-dive, not a quick answer
+- No filler, no hedging, no "it depends" without immediately explaining what it depends on
+
+Respond with exactly this format:
+QUESTION: <the question>
+ANSWER: <the expert answer>

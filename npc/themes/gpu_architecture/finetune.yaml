@@ -1,0 +1,18 @@
+# Fine-tune config for GPU Architecture & Kernel Engineering theme
+# Used by: pipeline/train.py
+
+base_model: /home/kmbandy/models/SmolLM3-3B-Base
+output_dir: /home/kmbandy/mad-lab-train/output/smollm3-gpu-arch
+
+# Training
+num_epochs: 4
+micro_batch_size: 1
+gradient_accumulation_steps: 16
+learning_rate: 1e-4
+warmup_steps: 30
+sequence_len: 2048
+
+# LoRA — higher rank for dense technical knowledge
+lora_r: 32
+lora_alpha: 64
+lora_dropout: 0.05

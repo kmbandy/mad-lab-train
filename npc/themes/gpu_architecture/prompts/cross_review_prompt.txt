@@ -1,0 +1,7 @@
+Review this GPU architecture training sample:
+
+Category: {{ category }}
+Question: {{ question }}
+
+Answer:
+{{ response }}

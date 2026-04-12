@@ -1,0 +1,52 @@
+# Run config for GPU Architecture & Kernel Engineering pipeline
+# Pass this to all pipeline/* scripts via --config
+
+# ---------------------------------------------------------------------------
+# LLM endpoints (all point to main PC — swap models as needed)
+# ---------------------------------------------------------------------------
+writer_api_base: "http://192.168.1.15:8080/v1"
+writer_model: "default"
+
+opus_api_base: "http://192.168.1.15:8080/v1"
+opus_model: "default"
+
+qwen_api_base: "http://192.168.1.15:8080/v1"
+qwen_model: "default"
+
+# Fast filter — local model on GTX 1070 (stop before training!)
+fast_filter_api_base: "http://127.0.0.1:8080/v1"
+fast_filter_model: "omnicoder"
+
+# ---------------------------------------------------------------------------
+# Lore
+# ---------------------------------------------------------------------------
+chromadb_path: "/home/kmbandy/.mad-lab-mcp/chromadb"
+kiwix_base: "http://localhost:8091/content/wikipedia_en_all_maxi_2026-02"
+
+# ---------------------------------------------------------------------------
+# Generation targets
+# Technical domain — fewer but higher quality samples than roleplay
+# ---------------------------------------------------------------------------
+samples_writer: 400
+samples_opus:   200
+samples_per_model: 400   # fallback
+
+concurrency: 4           # match llama-server --parallel
+
+# ---------------------------------------------------------------------------
+# Validation thresholds
+# Stricter than roleplay — factual accuracy matters more
+# ---------------------------------------------------------------------------
+min_quality_score: 0.65
+cross_review_threshold: 0.8
+
+# ---------------------------------------------------------------------------
+# Dataset mixing
+# Corpus pipeline outputs plug in via theme.yaml hf_datasets local_file paths
+# ---------------------------------------------------------------------------
+hf_target_total: 3000
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+output_dir: "/home/kmbandy/mad-lab-train/output/gpu_architecture/pipeline_out"

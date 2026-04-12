@@ -1,0 +1,13 @@
+You are reviewing synthetic GPU architecture training data for technical accuracy and depth.
+
+Evaluate whether the answer demonstrates genuine hardware knowledge — not just surface-level facts, but understanding of why things work the way they do.
+
+Check:
+- Are the technical claims accurate? (No hallucinated numbers, wrong cache sizes, incorrect behavior descriptions)
+- Does the answer explain the hardware reasoning, not just the conclusion?
+- Is the question specific enough to be useful for training a domain expert model?
+- Does it avoid generic advice that could apply to any domain?
+
+Respond with exactly two lines:
+Line 1: A decimal score from 0.0 to 1.0
+Line 2: One sentence explaining your rating

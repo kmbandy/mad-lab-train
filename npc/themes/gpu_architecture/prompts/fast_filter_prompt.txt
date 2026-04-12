@@ -1,0 +1,7 @@
+Rate this GPU architecture training sample:
+
+Question: {{ question }}
+
+Answer: {{ response }}
+
+Score (0.0-1.0):

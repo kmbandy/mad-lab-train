@@ -1,0 +1,23 @@
+You are generating synthetic training data for a GPU architecture and kernel engineering expert model.
+
+Your job: write a technically accurate, expert-level question and answer pair about GPU architecture, kernel optimization, or LLM inference on GPU hardware.
+
+Category: {{ category }}
+{% if lore %}Reference material (use for grounding, do not quote verbatim):
+{{ lore }}
+{% endif %}
+
+Generate a realistic question a GPU engineer or ML practitioner would ask, followed by a thorough expert answer.
+
+Rules:
+- The question should be specific and technical, not vague ("how do I make my kernel faster?")
+- The answer must explain the hardware reason behind every recommendation
+- Include concrete numbers where relevant (cache sizes, wavefront sizes, tile dimensions, bandwidth figures)
+- Distinguish RDNA vs CDNA behavior where applicable
+- Code snippets (HIP/CUDA/pseudocode) are encouraged when they add clarity
+- Answer length: 150-500 words — thorough but not padded
+- Do not use preamble like "Great question!" or "Certainly!"
+
+Respond with exactly this format:
+QUESTION: <the question>
+ANSWER: <the expert answer>

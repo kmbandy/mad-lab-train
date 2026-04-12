@@ -1,0 +1,37 @@
+# Fine-tune config for Quantum Mechanics Tutor theme
+# Used by: pipeline/train.py
+
+base_model: /home/kmbandy/models/SmolLM3-3B-Base
+output_dir: /home/kmbandy/mad-lab-train/output/smollm3-quantum
+
+# Data (defaults to run config output_dir/train.jsonl if not set)
+# train_data: /path/to/train.jsonl
+# eval_data:  /path/to/eval.jsonl
+
+# Training
+num_epochs: 4                 # extra epoch — technical domain needs more passes
+micro_batch_size: 1
+gradient_accumulation_steps: 16
+learning_rate: 1e-4           # slightly lower — preserve base model's reasoning
+warmup_steps: 30
+sequence_len: 2048
+
+# LoRA
+lora_r: 32                    # higher rank — more capacity for technical knowledge
+lora_alpha: 64
+lora_dropout: 0.05
+
+# Optional overrides (defaults shown):
+# weight_decay: 0.01
+# max_grad_norm: 1.0
+# gradient_checkpointing: false
+# packing: false
+# lr_scheduler_type: cosine
+# logging_steps: 10
+# eval_steps: 100
+# save_steps: 100
+# save_total_limit: 2
+# seed: 42
+# lora_target_modules: all-linear
+# report_to: none
+# wandb_project: quantum-tutor
