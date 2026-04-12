@@ -181,8 +181,11 @@ def _worker_chunk(
     Opens its own Archive instance (not picklable, must be created per-process).
     Returns list of (content_hash, result) tuples.
     """
+    from pathlib import Path as _Path
     from libzim.reader import Archive as _Archive
-    zim = _Archive(zim_path)
+    zim = _Archive(_Path(zim_path))
+    if zim.entry_count == 0:
+        return []
     tags_set = set(require_tags) if require_tags else None
     results = []
 
