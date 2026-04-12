@@ -105,19 +105,20 @@ mode_package() {
     du -sh "$TARBALL"
 
     echo "[5/6] Staging to S3..."
-    mkdir -p "$JOBS_DIR"
-    rm -f "$JOBS_DIR/$TARBALL" "$JOBS_DIR/quant.sh"
-    cp "$TARBALL" "$JOBS_DIR/"
-    cp "$0" "$JOBS_DIR/quant.sh"  # standalone copy for user-data bootstrap
+    # Use aws s3 directly — mountpoint-s3 doesn't allow overwrite/delete by default
+    aws s3 cp "$TARBALL" "s3://${S3_FILES_BUCKET}/quant-jobs/$TARBALL"
+    aws s3 cp "$0" "s3://${S3_FILES_BUCKET}/quant-jobs/quant.sh"
+    echo "  Tarball + quant.sh staged"
 
-    S3_MODEL_DIR="$S3_MOUNT_POINT/models/$CONFIG_NAME"
-    if [ ! -d "$S3_MODEL_DIR" ] || [ -z "$(ls -A "$S3_MODEL_DIR" 2>/dev/null)" ]; then
+    # Sync model to S3 (aws s3 sync skips files that already exist)
+    S3_MODEL_PREFIX="s3://${S3_FILES_BUCKET}/models/$CONFIG_NAME"
+    EXISTING=$(aws s3 ls "${S3_MODEL_PREFIX}/" 2>/dev/null | wc -l)
+    if [ "$EXISTING" -eq 0 ]; then
         echo "  Uploading model to S3 (this may take a while)..."
-        mkdir -p "$S3_MODEL_DIR"
-        rsync -a --no-perms --no-owner --no-group \
-            --exclude='.cache' \
-            "$CONFIG_MODEL_DIR/" "$S3_MODEL_DIR/"
-        echo "  Model staged at $S3_MODEL_DIR"
+        aws s3 sync "$CONFIG_MODEL_DIR/" "${S3_MODEL_PREFIX}/" \
+            --exclude '*/.cache/*' \
+            --no-progress
+        echo "  Model staged at ${S3_MODEL_PREFIX}"
     else
         echo "  Model already in S3, skipping upload"
     fi
@@ -152,13 +153,13 @@ mode_run() {
     eval $(parse_yaml)
 
     echo "[1b/11] Pulling model from S3..."
-    S3_MODEL_DIR="$S3_MOUNT_POINT/models/$JOB_NAME"
-    if [ ! -d "$S3_MODEL_DIR" ]; then
-        echo "ERROR: Model not found in S3 at $S3_MODEL_DIR"
+    S3_MODEL_PREFIX="s3://${S3_FILES_BUCKET}/models/$JOB_NAME"
+    if ! aws s3 ls "${S3_MODEL_PREFIX}/" &>/dev/null; then
+        echo "ERROR: Model not found in S3 at ${S3_MODEL_PREFIX}"
         exit 1
     fi
     mkdir -p model
-    cp -r "$S3_MODEL_DIR/." model/
+    aws s3 sync "${S3_MODEL_PREFIX}/" model/ --no-progress
     echo "  Model ready ($(du -sh model/ | cut -f1))"
 
     echo "[2/11] Installing system deps..."
@@ -210,7 +211,7 @@ mode_run() {
     GPU_ARCH=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '.' || echo "cpu")
     CUDA_VER=$(nvcc --version 2>/dev/null | grep "release" | sed 's/.*release \([0-9]*\.[0-9]*\).*/\1/' | tr '.' '_' || echo "none")
     CACHE_KEY="sm${GPU_ARCH}_cuda${CUDA_VER}"
-    LLAMA_BIN_CACHE="$S3_MOUNT_POINT/llama-builds/${CACHE_KEY}"
+    LLAMA_BIN_S3="s3://${S3_FILES_BUCKET}/llama-builds/${CACHE_KEY}"
 
     echo "  GPU arch: sm${GPU_ARCH}  CUDA: ${CUDA_VER}  cache key: ${CACHE_KEY}"
 
@@ -221,14 +222,18 @@ mode_run() {
     fi
     mkdir -p "$WORK_DIR/llama.cpp/build/bin"
 
-    if [ -f "$LLAMA_BIN_CACHE/llama-quantize" ] && [ -f "$LLAMA_BIN_CACHE/llama-imatrix" ]; then
+    CACHE_HIT=false
+    if aws s3 ls "${LLAMA_BIN_S3}/llama-quantize" &>/dev/null; then
         echo "  Cache hit — restoring binaries..."
-        cp "$LLAMA_BIN_CACHE/llama-quantize" "$WORK_DIR/llama.cpp/build/bin/"
-        cp "$LLAMA_BIN_CACHE/llama-imatrix"  "$WORK_DIR/llama.cpp/build/bin/"
+        aws s3 cp "${LLAMA_BIN_S3}/llama-quantize" "$WORK_DIR/llama.cpp/build/bin/llama-quantize" --no-progress
+        aws s3 cp "${LLAMA_BIN_S3}/llama-imatrix"  "$WORK_DIR/llama.cpp/build/bin/llama-imatrix"  --no-progress
         chmod +x "$WORK_DIR/llama.cpp/build/bin/llama-quantize"
         chmod +x "$WORK_DIR/llama.cpp/build/bin/llama-imatrix"
         echo "  Skipping build — using cached binaries"
-    else
+        CACHE_HIT=true
+    fi
+
+    if [ "$CACHE_HIT" = "false" ]; then
         echo "  Cache miss — building llama.cpp (this takes 15-20 min)..."
         cd "$WORK_DIR/llama.cpp"
         START_BUILD=$(date +%s)
@@ -244,9 +249,8 @@ mode_run() {
         echo "  Build time: $((END_BUILD - START_BUILD))s"
 
         echo "  Caching binaries → S3 (${CACHE_KEY})..."
-        mkdir -p "$LLAMA_BIN_CACHE"
-        cp build/bin/llama-quantize "$LLAMA_BIN_CACHE/"
-        cp build/bin/llama-imatrix  "$LLAMA_BIN_CACHE/"
+        aws s3 cp build/bin/llama-quantize "${LLAMA_BIN_S3}/llama-quantize" --no-progress
+        aws s3 cp build/bin/llama-imatrix  "${LLAMA_BIN_S3}/llama-imatrix"  --no-progress
         echo "  Cached — future runs will skip the build"
         cd "$OLDPWD"
     fi
@@ -308,10 +312,9 @@ mode_run() {
     [ -n "$IMATRIX_FILE" ] && rm -f "$IMATRIX_FILE"
 
     echo "[10/11] Writing output to S3..."
-    mkdir -p "$OUTPUT_DIR"
     for QUANT in $CONFIG_QUANTS; do
         OUT_FILE="$WORK_DIR/$CONFIG_OUTPUT_PREFIX-$QUANT.gguf"
-        cp "$OUT_FILE" "$OUTPUT_DIR/"
+        aws s3 cp "$OUT_FILE" "s3://${S3_FILES_BUCKET}/quant-output/$CONFIG_OUTPUT_PREFIX-$QUANT.gguf" --no-progress
         echo "  Uploaded: $CONFIG_OUTPUT_PREFIX-$QUANT.gguf ($(du -sh "$OUT_FILE" | cut -f1))"
     done
 
