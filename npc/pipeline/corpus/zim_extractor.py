@@ -236,6 +236,9 @@ def extract_zim(
     extracted = 0
 
     if workers > 1:
+        # Close the parent's Archive before forking — libzim C++ state inherited
+        # by child processes conflicts with their own Archive instances
+        del zim
         # Split entry ID space into chunks — pass (start, end) not ID lists to avoid
         # materializing 66M integers in memory
         chunk_size = max(1, total // workers)
