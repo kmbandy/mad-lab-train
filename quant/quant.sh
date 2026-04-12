@@ -87,27 +87,41 @@ mode_package() {
     STAGING_DIR="quant-job-$CONFIG_NAME"
     rm -rf "$STAGING_DIR"
     mkdir -p "$STAGING_DIR"
-    
+
     cp quant.yaml "$STAGING_DIR/"
     cp "$0" "$STAGING_DIR/quant.sh"
-    cp -r "$CONFIG_MODEL_DIR" "$STAGING_DIR/model"
-    
+
     if [ "$CONFIG_IMATRIX" = "true" ]; then
         cp -r imatrix "$STAGING_DIR/"
     fi
 
-    echo "[3/5] Creating tarball..."
+    echo "[3/5] Creating tarball (scripts + calibration only, no model)..."
     TARBALL="$STAGING_DIR.tar.gz"
     tar -czf "$TARBALL" "$STAGING_DIR"
     du -sh "$TARBALL"
 
-    echo "[4/5] Copying tarball to S3 mount..."
+    echo "[4/5] Staging to S3..."
     mkdir -p "$JOBS_DIR"
     cp "$TARBALL" "$JOBS_DIR/"
+
+    # Copy model to S3 models dir so EC2 can pull it
+    S3_MODEL_DIR="$S3_MOUNT_POINT/models/$CONFIG_NAME"
+    if [ ! -d "$S3_MODEL_DIR" ]; then
+        echo "  Uploading model to S3 (this may take a while)..."
+        mkdir -p "$S3_MODEL_DIR"
+        rsync -a --no-perms --no-owner --no-group \
+            --exclude='.cache' \
+            "$CONFIG_MODEL_DIR/" "$S3_MODEL_DIR/"
+        echo "  Model staged at $S3_MODEL_DIR"
+    else
+        echo "  Model already in S3, skipping upload"
+    fi
+
     echo "Job staged. On EC2 run: bash quant.sh --run $CONFIG_NAME"
 
     echo "[5/5] Cleaning up local staging dir..."
     rm -rf "$STAGING_DIR"
+    rm -f "$TARBALL"
 }
 
 # --- MODE: --run ---
@@ -126,6 +140,15 @@ mode_run() {
     # Load config from unpacked dir
     ensure_pyyaml
     eval $(parse_yaml)
+
+    echo "[1b/11] Pulling model from S3..."
+    S3_MODEL_DIR="$S3_MOUNT_POINT/models/$CONFIG_NAME"
+    if [ ! -d "$S3_MODEL_DIR" ]; then
+        echo "ERROR: Model not found in S3 at $S3_MODEL_DIR"
+        exit 1
+    fi
+    cp -r "$S3_MODEL_DIR" model/
+    echo "  Model ready ($(du -sh model/ | cut -f1))"
 
     echo "[2/11] Installing system deps..."
     sudo apt-get update -qq

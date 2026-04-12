@@ -1,0 +1,9 @@
+name: deepseek-coder-v2-lite-instruct
+model_dir: /mnt/mainpc/models/DeepSeek-Coder-V2-Lite-Instruct
+quants:
+  - Q6_K
+  - Q5_K_M
+  - Q4_K_M
+imatrix: true
+output_prefix: deepseek-coder-v2-lite-instruct
+gpu: true

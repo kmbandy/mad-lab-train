@@ -1,0 +1,5 @@
+model/
+imatrix/calibration.txt
+quant-job-*/
+*.tar.gz
+*.gguf
