@@ -231,7 +231,13 @@ def main() -> None:
     parser.add_argument("--min-score", type=int, default=1)
     parser.add_argument("--min-ans-score", type=int, default=0)
     parser.add_argument("--max", type=int, default=0, help="Max per ZIM (0=all)")
-    args = parser.parse_args()
+    args, extra = parser.parse_known_args()
+
+    # parse_known_args captures zim paths that appear after flags like --no-tag-filter
+    for p in extra:
+        if p.startswith("-"):
+            parser.error(f"unrecognized argument: {p}")
+        args.zim_paths.append(p)
 
     # Collect ZIM paths
     zim_paths: list[Path] = []
