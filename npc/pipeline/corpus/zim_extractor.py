@@ -240,8 +240,9 @@ def extract_zim(
         # by child processes conflicts with their own Archive instances
         del zim
         # Split entry ID space into chunks — pass (start, end) not ID lists to avoid
-        # materializing 66M integers in memory
-        chunk_size = max(1, total // workers)
+        # materializing 66M integers in memory. Cap chunk size so results stream back
+        # frequently rather than waiting for one giant chunk to finish.
+        chunk_size = min(max(1, total // workers), 250_000)
         boundaries = [(i, min(i + chunk_size, total)) for i in range(0, total, chunk_size)]
         require_tags_list = list(require_tags) if require_tags else None
 
