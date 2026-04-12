@@ -54,7 +54,7 @@ GPU_TAGS = {
 
 def clean_html(html_fragment: str) -> str:
     """Strip HTML tags, preserve code blocks with markers."""
-    soup = BeautifulSoup(html_fragment, "html.parser")
+    soup = BeautifulSoup(html_fragment, "lxml")
     for code in soup.find_all("code"):
         code.replace_with(f"`{code.get_text()}`")
     for pre in soup.find_all("pre"):
@@ -89,9 +89,15 @@ def extract_entry(html: str, require_tags: set[str] | None = None) -> dict | Non
     Parse a SO/SE question page, return Q&A pair if it has an accepted answer.
     If require_tags is provided, at least one tag must match.
     """
-    soup = BeautifulSoup(html, "html.parser")
+    # Cheap pre-filter before full parse: reject if no GPU tag string appears anywhere
+    if require_tags:
+        html_lower = html.lower()
+        if not any(t in html_lower for t in require_tags):
+            return None
 
-    # Tag filter
+    soup = BeautifulSoup(html, "lxml")
+
+    # Tag filter (precise check now that we've parsed)
     if require_tags:
         page_tags = extract_tags(soup)
         if not any(t in require_tags for t in page_tags):
