@@ -29,8 +29,8 @@ HF_SHARDS=3
 
 # --- Generation config ---
 LLAMA_PORT=8080
-LLAMA_PARALLEL=256      # tool call prompts are short — 256 slots fine
-LLAMA_CTX=2048          # 2048 per slot; total = 256 * 2048 = 524,288
+LLAMA_PARALLEL=96       # 96 slots × 2048 ctx = ~90GB total, fits 96GB with 59GB model (7GB headroom)
+LLAMA_CTX=2048          # 2048 per slot — generator prompts are ~1100 tokens + 1500 output, needs 2048 min
 PER_SCENARIO=5000       # 10 scenarios × 5000 = 50k total samples
 CONCURRENCY=256
 
@@ -57,7 +57,7 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 
 wait_for_llama() {
     local port=$1
-    local max_wait=180
+    local max_wait=600
     local waited=0
     echo "  Waiting for llama-server on port $port..."
     while ! curl -sf "http://localhost:$port/health" | grep -q '"status":"ok"' 2>/dev/null; do

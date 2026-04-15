@@ -21,3 +21,5 @@ adapter_model/
 checkpoint-*/
 runs/
 .gitnexus
+.claude/
+output/

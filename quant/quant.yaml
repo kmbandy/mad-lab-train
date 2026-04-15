@@ -7,3 +7,16 @@ quants:
 imatrix: true
 output_prefix: deepseek-coder-v2-lite-instruct
 gpu: true
+
+# EC2 launch config
+ec2_instance_type: g7e.2xlarge
+ec2_max_spot_price: "0.80"
+ec2_ami: ami-03bda78a7c7c13b45
+ec2_storage_gb: 200
+ec2_key_name: mad-lab-key
+ec2_iam_profile: arn:aws:iam::080869524552:instance-profile/mad-lab-ec2-quant-role
+ec2_vpc_id: vpc-0a8e766998c7d5e23
+ec2_region: us-east-2
+
+# HuggingFace publish config (optional — defaults to mad-lab-ai/<output_prefix>-GGUF)
+# hf_repo: mad-lab-ai/DeepSeek-Coder-V2-Lite-Instruct-GGUF

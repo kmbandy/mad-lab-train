@@ -152,10 +152,70 @@ def _fetch_kiwix(url: str, max_chars: int, cache: dict) -> str:
 def fetch_lore(theme: Theme, run_cfg: dict, query: str) -> tuple[str, str]:
     """
     Fetch lore context. Returns (label, text).
-    Tries ChromaDB first, then Kiwix (if configured in theme).
+    Tries static lore bundle first, then ChromaDB, then Kiwix.
     """
     lore_cfg = theme.cfg.get("lore", {})
     parts: list[str] = []
+
+    # Qdrant lore (local or cloud) — semantic search over GPU/AMD docs, PRs, arXiv
+    qdrant_url = run_cfg.get("qdrant_url", "")
+    qdrant_api_key = run_cfg.get("qdrant_api_key", "")
+    qdrant_collection = run_cfg.get("qdrant_collection", "memory")
+    qdrant_sources = run_cfg.get("qdrant_sources", ["amd_gpu_docs", "github_prs", "arxiv_gpu"])
+    if qdrant_url:
+        try:
+            from qdrant_client import QdrantClient
+            from qdrant_client.http import models as qm
+            _qc = QdrantClient(url=qdrant_url, api_key=qdrant_api_key or None)
+            # Use scroll with source filter — no local embedding model needed
+            hits: list[str] = []
+            query_words = set(query.lower().split())
+            for source in qdrant_sources:
+                result, _ = _qc.scroll(
+                    collection_name=qdrant_collection,
+                    limit=50,
+                    scroll_filter=qm.Filter(must=[
+                        qm.FieldCondition(key="source", match=qm.MatchValue(value=source))
+                    ]),
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                scored = []
+                for point in result:
+                    content = (point.payload or {}).get("content", "")
+                    if not content:
+                        continue
+                    score = sum(1 for w in query_words if w in content.lower())
+                    if score > 0:
+                        scored.append((score, content))
+                scored.sort(key=lambda x: x[0], reverse=True)
+                hits.extend(c for _, c in scored[:2])
+            if hits:
+                parts.append("Reference material (GPU/AMD docs):\n" + "\n---\n".join(hits[:4]))
+        except Exception as e:
+            print(f"  [warn] Qdrant lore: {e}", file=sys.stderr)
+
+    # Static lore bundle fallback (pre-exported JSONL, used if qdrant_url not set)
+    static_lore_path = run_cfg.get("static_lore_path", "")
+    if static_lore_path and not qdrant_url:
+        try:
+            import json as _json
+            lore_file = Path(static_lore_path)
+            if lore_file.exists():
+                records = [_json.loads(l) for l in lore_file.read_text().splitlines() if l.strip()]
+                query_words = set(query.lower().split())
+                scored = []
+                for r in records:
+                    content = r.get("content", "").lower()
+                    score = sum(1 for w in query_words if w in content)
+                    if score > 0:
+                        scored.append((score, r))
+                scored.sort(key=lambda x: x[0], reverse=True)
+                hits = [r["content"] for _, r in scored[:3]]
+                if hits:
+                    parts.append("Reference material (GPU/AMD docs):\n" + "\n---\n".join(hits))
+        except Exception as e:
+            print(f"  [warn] static lore: {e}", file=sys.stderr)
 
     # ChromaDB
     chroma_path = run_cfg.get("chromadb_path", "")

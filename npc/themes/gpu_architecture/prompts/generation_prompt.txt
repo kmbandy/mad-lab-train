@@ -1,0 +1,7 @@
+Category: {{ category }}
+{% if lore_context %}
+Reference material (use for grounding, do not quote verbatim):
+{{ lore_context }}
+{% endif %}
+
+Generate the QUESTION and ANSWER now.
