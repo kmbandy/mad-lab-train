@@ -6,7 +6,7 @@ S3_FILES_BUCKET="mad-lab-files"
 S3_MOUNT_POINT="$HOME/s3/mad-lab-files"
 JOBS_DIR="$S3_MOUNT_POINT/quant-jobs"
 OUTPUT_DIR="$S3_MOUNT_POINT/quant-output"
-LLAMA_CPP_REPO="https://github.com/ggerganov/llama.cpp"
+LLAMA_CPP_REPO="https://github.com/kmbandy/llama.cpp"
 MOUNTPOINT_S3_VERSION="1.22.2"
 
 # --- HELPERS ---
@@ -69,11 +69,12 @@ mode_package() {
         exit 1
     fi
 
+    CALIBRATION_FILE="imatrix/${CONFIG_IMATRIX_CALIBRATION:-calibration.txt}"
     if [ "$CONFIG_IMATRIX" = "true" ]; then
-        if [ -f "./imatrix/calibration.txt" ]; then
-            echo "PASS: imatrix/calibration.txt exists"
+        if [ -f "./$CALIBRATION_FILE" ]; then
+            echo "PASS: $CALIBRATION_FILE exists"
         else
-            echo "FAIL: imatrix/calibration.txt not found"
+            echo "FAIL: $CALIBRATION_FILE not found"
             exit 1
         fi
     fi
@@ -112,7 +113,8 @@ mode_package() {
 
     # Sync model to S3 (aws s3 sync skips files that already exist)
     S3_MODEL_PREFIX="s3://${S3_FILES_BUCKET}/models/$CONFIG_NAME"
-    EXISTING=$(aws s3 ls "${S3_MODEL_PREFIX}/" 2>/dev/null | wc -l)
+    EXISTING=0
+    EXISTING=$(aws s3 ls "${S3_MODEL_PREFIX}/" 2>/dev/null | wc -l) || true
     if [ "$EXISTING" -eq 0 ]; then
         echo "  Uploading model to S3 (this may take a while)..."
         aws s3 sync "$CONFIG_MODEL_DIR/" "${S3_MODEL_PREFIX}/" \
@@ -148,6 +150,7 @@ mode_run() {
 
     ensure_pyyaml
     eval $(parse_yaml)
+    CALIBRATION_FILE="imatrix/${CONFIG_IMATRIX_CALIBRATION:-calibration.txt}"
 
     echo "[1b/11] Pulling model from S3..."
     S3_MODEL_PREFIX="s3://${S3_FILES_BUCKET}/models/$JOB_NAME"
@@ -248,7 +251,7 @@ mode_run() {
     # Always clone for Python scripts (fast, depth=1)
     if [ ! -d "$WORK_DIR/llama.cpp" ]; then
         echo "  Cloning llama.cpp..."
-        git clone --depth=1 "$LLAMA_CPP_REPO" "$WORK_DIR/llama.cpp"
+        git clone --depth=1 --branch master "$LLAMA_CPP_REPO" "$WORK_DIR/llama.cpp"
     fi
     mkdir -p "$WORK_DIR/llama.cpp/build/bin"
 
@@ -302,9 +305,10 @@ mode_run() {
         IMATRIX_FILE="$WORK_DIR/$CONFIG_OUTPUT_PREFIX.imatrix"
         "$WORK_DIR/llama.cpp/build/bin/llama-imatrix" \
             -m "$F16_OUT" \
-            -f imatrix/calibration.txt \
+            -f "$CALIBRATION_FILE" \
             -o "$IMATRIX_FILE" \
-            --chunks 128
+            --chunks 128 \
+            -ngl 999
         END_IMATRIX=$(date +%s)
         echo "  Imatrix time: $((END_IMATRIX - START_IMATRIX))s"
     else
@@ -324,6 +328,7 @@ mode_run() {
         fi
 
         "$WORK_DIR/llama.cpp/build/bin/llama-quantize" \
+            --allow-requantize \
             $IMATRIX_ARG \
             "$F16_OUT" \
             "$OUT_FILE" \
@@ -408,8 +413,9 @@ mode_publish() {
     fi
 
     echo "[2/4] Installing huggingface-hub CLI..."
-    if ! command -v huggingface-cli &>/dev/null; then
-        pip install -q huggingface-hub[cli]
+    if ! command -v hf &>/dev/null; then
+        pip install -q huggingface-hub
+        export PATH="$PATH:$HOME/.local/bin"
     fi
 
     echo "[3/4] Pulling GGUFs from S3..."
@@ -421,17 +427,23 @@ mode_publish() {
     done
 
     # Copy calibration data if imatrix was used
-    if [ "$CONFIG_IMATRIX" = "true" ] && [ -f "imatrix/calibration.txt" ]; then
-        cp imatrix/calibration.txt publish-tmp/imatrix-calibration.txt
+    CALIBRATION_FILE="imatrix/${CONFIG_IMATRIX_CALIBRATION:-calibration.txt}"
+    if [ "$CONFIG_IMATRIX" = "true" ] && [ -f "$CALIBRATION_FILE" ]; then
+        cp "$CALIBRATION_FILE" publish-tmp/imatrix-calibration.txt
     fi
 
     echo "[4/4] Uploading to HuggingFace..."
     HF_REPO="${CONFIG_HF_REPO:-mad-lab-ai/${CONFIG_OUTPUT_PREFIX}-GGUF}"
-    HF_TOKEN="$HF_TOKEN" huggingface-cli upload \
-        "$HF_REPO" \
-        publish-tmp/ \
-        --repo-type model \
-        --commit-message "Add GGUF quants: $CONFIG_QUANTS"
+    for QUANT in $CONFIG_QUANTS; do
+        FILE="publish-tmp/$CONFIG_OUTPUT_PREFIX-$QUANT.gguf"
+        echo "  Uploading $QUANT..."
+        HF_TOKEN="$HF_TOKEN" hf upload \
+            "$HF_REPO" \
+            "$FILE" \
+            "$CONFIG_OUTPUT_PREFIX-$QUANT.gguf" \
+            --repo-type model \
+            --commit-message "Add $QUANT quant"
+    done
 
     echo ""
     echo "Published to: https://huggingface.co/$HF_REPO"

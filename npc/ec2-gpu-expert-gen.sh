@@ -15,11 +15,11 @@ set -euo pipefail
 
 # --- S3 / model config ---
 S3_BUCKET="mad-lab-files"
-S3_MODEL_KEY="quant-output/deepseek-coder-v2-lite-instruct-Q6_K.gguf"
+S3_MODEL_KEY="quant-output/Qwen3.6-35B-A3B-UD-Q5_K_M.gguf"
 S3_JOB_PREFIX="gpu-expert-jobs"
 S3_OUTPUT_PREFIX="gpu-expert-output"
 S3_LLAMA_BUILD_PREFIX="llama-builds"
-LLAMA_CPP_REPO="https://github.com/ggerganov/llama.cpp"
+LLAMA_CPP_REPO="https://github.com/kmbandy/llama.cpp"
 MOUNTPOINT_S3_VERSION="1.22.2"
 
 # --- Generation config ---
@@ -31,9 +31,9 @@ SAMPLES_OPUS=10000      # per instance; 3 instances = 30k opus raw (75k total, f
 CONCURRENCY=256         # match LLAMA_PARALLEL
 
 # --- Temperature variants ---
-VARIANTS=("t60" "t75" "t90")
-WRITER_TEMPS=("0.60" "0.75" "0.90")
-OPUS_TEMPS=("0.55"  "0.70" "0.85")
+VARIANTS=("t75" "t90")
+WRITER_TEMPS=("0.75" "0.90")
+OPUS_TEMPS=("0.70" "0.85")
 
 # --- EC2 config ---
 EC2_REGION="us-east-2"
