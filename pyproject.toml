@@ -25,12 +25,14 @@ dependencies = [
     "qdrant-client>=1.9.0",
     "duckdb>=0.10.0",
     "pyyaml>=6.0.0",
+    "huggingface_hub>=0.23.0",
     # ML training stack — torch must be installed separately (ROCm vs CUDA wheel)
     "transformers>=4.40.0",
     "trl>=0.9.0",
     "peft>=0.11.0",
     "bitsandbytes>=0.43.0",
     "accelerate>=0.29.0",
+    "mergekit>=0.0.4",
 ]
 
 [project.scripts]
