@@ -24,6 +24,7 @@ dependencies = [
     "beautifulsoup4>=4.12.0",
     "qdrant-client>=1.9.0",
     "duckdb>=0.10.0",
+    "pyyaml>=6.0.0",
     # ML training stack — torch must be installed separately (ROCm vs CUDA wheel)
     "transformers>=4.40.0",
     "trl>=0.9.0",
