@@ -1234,4 +1234,105 @@ When stages are chained, outputs are automatically wired to inputs at job creati
 
 ---
 
-*Last updated: 2026-05-02 — MAD-69, compute architecture design session*
+---
+
+## 10. Dashboard UI — Training Central Command
+
+### 10.1 Tab Structure
+
+The Training Central Command occupies a single top-level tab in mad-dashboard. Inside it are two sub-tabs: **Status** and **New Job**.
+
+### 10.2 Status Tab
+
+**Run list (top):** table of all runs, newest first.
+
+| Column | Notes |
+|--------|-------|
+| Name | run name |
+| Template | template label |
+| Model | primary model (from first stage config) |
+| Status | color-coded pill |
+| Target | `local` or `ec2` |
+| Duration | elapsed or total time |
+| Created | relative timestamp |
+
+Click a row → expands detail panel below (or slide-in panel).
+
+**Detail panel layout — split:**
+- **Left:** Cytoscape chain graph — all stages as nodes, edges showing flow
+- **Right:** tabbed panel with tabs: Overview, Config, Logs, Events
+
+Default tab by status: running → Logs, completed/failed → Overview, paused → Overview.
+
+**Overview tab:** run metadata (id, name, template, target, timing), stage timing table, error message if failed, gate failure details if paused.
+
+**Config tab:** full stage configs rendered as read-only YAML-style view. If status is `pending` or `queued`, an Edit button opens the inline edit form.
+
+**Logs tab:** live-tailing log output from `~/.mad-lab-train/logs/{run_id}/`. Stage selector dropdown when multiple stages have logs. Auto-scrolls to bottom; scroll up to pause auto-scroll.
+
+**Events tab:** structured event stream from the `events` table, newest-first. Filterable by stage and event type.
+
+**Queue action buttons** (visible based on status):
+
+| Status | Available Actions |
+|--------|------------------|
+| `pending` | Start, Set as Next, Schedule, Edit Config, Cancel |
+| `queued` | Start, Edit Config, Cancel |
+| `running` | Pause, Force Pause, Cancel |
+| `paused` (clean) | Resume, Cancel |
+| `paused` (gate failure) | Adjust Config + Retry Merge, Override Gate, Abort |
+
+**Notifications:** visual only. Tab title shows badge count of active runs. Status pills update live via SSE. No browser push notifications (notification framework deferred — larger play across agents + dashboard at scale).
+
+### 10.3 Cytoscape Chain Visualization
+
+Each stage is a node. Directed edges show execution order. Node appearance by status:
+
+| Status | Color | Label |
+|--------|-------|-------|
+| `pending` | gray | stage type |
+| `running` | yellow, pulsing | stage type + progress % |
+| `completed` | green | stage type + ✓ |
+| `failed` | red | stage type + ✗ |
+| `skipped` | light gray | stage type + skipped |
+| `paused` | amber | stage type + paused |
+
+**Progress % per stage type** (fed from SSE events in real time):
+
+| Stage | Event | Calculation |
+|-------|-------|-------------|
+| `finetune` / `pretrain` | `step` | `step / total_steps × 100` |
+| `data_gen` | `sample_generated` | `count / total × 100` |
+| `dataset_prep` | `source_complete` | `sources_done / total_sources × 100` |
+| `quant` | `quant_complete` | `types_done / total_types × 100` |
+| `prune` | `layer_pruned` | `layers_done / total_layers × 100` |
+| `eval` | `benchmark_complete` | `benchmarks_done / total × 100` |
+| `upload` | `upload_progress` | `bytes_sent / total_bytes × 100` |
+| `merge` / `convert` | — | spinner only (no granular progress) |
+
+The Cytoscape graph in the Status detail panel updates live. The same graph renders (static) in the New Job wizard sidebar during configuration.
+
+### 10.4 New Job Wizard (Stepper)
+
+**Step 0 — Template picker:**
+Grid of template cards. Each card shows: icon, label, chain summary (e.g. `dataset_prep → data_gen → finetune → quant`). Includes a "Custom" card for manual chain building. Selecting a template renders the chain as a Cytoscape preview immediately.
+
+**Step 1 — Run setup:**
+- Run name
+- Execution target: `local` | `ec2` (EC2 fields appear conditionally)
+- Scheduling: none | set as next | schedule for datetime (mutually exclusive)
+
+**Steps 2–N — One step per stage in the chain:**
+- Step header = stage type label
+- Form fields pre-populated from template defaults
+- Required fields marked, optional fields collapsible
+- Cytoscape chain graph in sidebar with current stage node pulsing
+
+**Final step — Review:**
+Full config summary (read-only). "Submit to Queue" button.
+
+Inline edit (for pending/queued runs from Status tab): same form as the wizard steps, but accessed directly at the stage level — no full re-wizard flow needed.
+
+---
+
+*Last updated: 2026-05-02 — MAD-69, compute architecture + full design session*
