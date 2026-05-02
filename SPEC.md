@@ -776,17 +776,79 @@ Full field reference for each stage type. All fields stored as JSONB in `stage_c
 
 ### 8.1 dataset_prep
 
+Output is a directory of tagged JSONL files consumed by downstream stages:
+- `training.jsonl` — ChatML messages format, consumed by `finetune` and `data_gen` (as few-shot pool)
+- `context.jsonl` — reference/seed docs, consumed by `data_gen` (randomly sampled per generation slot)
+- `calibration.jsonl` — plain text records, consumed by `quant` imatrix and `prune` calibration only
+
+All records are ChatML messages format. `calibration` records have no assistant turn. Consumers filter by file.
+
 | Field | Type | Default | Required |
 |-------|------|---------|----------|
 | `sources` | `list[SourceConfig]` | — | yes |
 | `train_split` | `float` | `0.9` | no |
 | `deduplicate` | `bool` | `true` | no |
 
-**SourceConfig types:** `huggingface`, `zim`, `qdrant`, `duckdb`, `raw`
+**SourceConfig — shared fields:**
+
+| Field | Type | Default | Required |
+|-------|------|---------|----------|
+| `type` | `huggingface \| zim \| qdrant \| duckdb \| raw` | — | yes |
+| `purpose` | `training \| context \| calibration` | `training` | no |
+| `max_records` | `int \| null` | `null` | no |
+
+**SourceConfig — `huggingface`:**
+
+| Field | Type | Default | Required |
+|-------|------|---------|----------|
+| `repo` | `string` | — | yes |
+| `split` | `string` | `train` | no |
+| `schema.format` | `instruction_response \| qa \| messages \| text` | — | yes |
+| `schema.instruction_col` | `string` | `instruction` | if format=instruction_response |
+| `schema.response_col` | `string` | `response` | if format=instruction_response |
+| `schema.question_col` | `string` | `question` | if format=qa |
+| `schema.answer_col` | `string` | `answer` | if format=qa |
+| `schema.system_col` | `string \| null` | `null` | no |
+| `schema.system_prompt` | `string \| null` | `null` | no |
+
+**SourceConfig — `zim`:**
+
+| Field | Type | Default | Required |
+|-------|------|---------|----------|
+| `path` | `string` | — | yes |
+| `query` | `string \| null` | `null` (all articles) | no |
+
+**SourceConfig — `qdrant`:**
+
+| Field | Type | Default | Required |
+|-------|------|---------|----------|
+| `url` | `string` | — | yes |
+| `collection` | `string` | — | yes |
+| `query` | `string` | — | yes |
+| `top_k` | `int` | `500` | no |
+
+**SourceConfig — `duckdb`:**
+
+| Field | Type | Default | Required |
+|-------|------|---------|----------|
+| `path` | `string` | — | yes |
+| `query` | `string` | — | yes |
+| `content_col` | `string` | `content` | no |
+
+**SourceConfig — `raw`:**
+
+| Field | Type | Default | Required |
+|-------|------|---------|----------|
+| `path` | `string` | — | yes |
+| `schema.format` | `messages \| text \| instruction_response \| qa` | `messages` | no |
 
 ### 8.2 data_gen
 
 Data gen always runs as hub-and-spoke from mad-lab-main regardless of run `execution_target`. See §9.3.
+
+**Context sampling:** when `context.jsonl` exists from a preceding `dataset_prep` stage, the coordinator randomly samples one context doc per generation slot and injects it into `user_template` as `{{ context }}`. Random sampling (not sequential) ensures variety across the full run and avoids topic drift. Each worker receives an independent random draw.
+
+`user_template` is a Jinja2 template. Available variables: `{{ context }}` (random context doc if available), `{{ topic }}` (optional explicit topic list, round-robined).
 
 | Field | Type | Default | Required |
 |-------|------|---------|----------|
@@ -799,6 +861,7 @@ Data gen always runs as hub-and-spoke from mad-lab-main regardless of run `execu
 | `ctx_size` | `int` | `2048` | no |
 | `quality_threshold` | `float 0–1` | `0.7` | no |
 | `judge_model` | `string \| null` | `null` | no |
+| `topics` | `list[string] \| null` | `null` | no |
 | `workers` | `list[WorkerConfig]` | — | yes |
 
 **WorkerConfig — local:**
@@ -874,10 +937,17 @@ Same as `finetune` training fields plus:
 
 ### 8.6 merge
 
+Two modes. `adapter` is auto-inserted by the executor when finetune → quant is detected and no explicit merge stage exists. Model-to-model modes use `mergekit` on CPU (no GPU required — SN850 NVMe handles I/O).
+
 | Field | Type | Default | Required |
 |-------|------|---------|----------|
+| `mode` | `adapter \| slerp \| ties \| dare_ties` | `adapter` | no |
 | `base_model` | `string` | — | yes |
-| `adapter_path` | `string` | auto-wired | no |
+| `adapter_path` | `string` | auto-wired | adapter mode only |
+| `model_b` | `string` | — | slerp/ties/dare_ties |
+| `model_c` | `string \| null` | `null` | ties/dare_ties (optional 3rd) |
+| `merge_ratio` | `float 0–1` | `0.5` | slerp only |
+| `density` | `float 0–1` | `0.5` | dare_ties (drop fraction) |
 | `eval_gate.enabled` | `bool` | `false` | no |
 | `eval_gate.benchmark` | `string` | `perplexity` | no |
 | `eval_gate.threshold` | `float` | — | if gate enabled |
@@ -1044,19 +1114,21 @@ When stages are chained, outputs are automatically wired to inputs at job creati
 
 | Producing Stage | Output | Consuming Stage | Auto-wired Field |
 |----------------|--------|-----------------|-----------------|
-| `dataset_prep` | `train.jsonl` | `data_gen` | `input_path` |
-| `dataset_prep` | `train.jsonl` | `finetune` | `dataset` |
-| `dataset_prep` | `eval.jsonl` | `finetune` | `eval_dataset` |
-| `dataset_prep` | `train.jsonl` | `quant` | `imatrix_dataset` |
-| `dataset_prep` | `train.jsonl` | `prune` | `calibration_dataset` |
-| `dataset_prep` | `eval.jsonl` | `eval` | benchmark dataset |
-| `data_gen` | `train.jsonl` | `finetune` | `dataset` *(if no dataset_prep)* |
-| `finetune` | adapter dir | `merge` | `adapter_path` |
+| `dataset_prep` | `context.jsonl` | `data_gen` | context pool (random sampled) |
+| `dataset_prep` | `training.jsonl` | `data_gen` | few-shot pool |
+| `dataset_prep` | `training.jsonl` | `finetune` | `dataset` |
+| `dataset_prep` | `training.jsonl` (eval split) | `finetune` | `eval_dataset` |
+| `dataset_prep` | `calibration.jsonl` | `quant` | `imatrix_dataset` |
+| `dataset_prep` | `calibration.jsonl` | `prune` | `calibration_dataset` |
+| `dataset_prep` | `calibration.jsonl` | `eval` | benchmark dataset |
+| `data_gen` | `generated.jsonl` | `finetune` | `dataset` *(merged with training.jsonl if both exist)* |
+| `finetune` | adapter dir | `merge (adapter mode)` | `adapter_path` |
+| `finetune` | adapter dir | `quant` | triggers auto-insert of `merge (adapter)` stage |
 | `pretrain` | model dir | `quant` | `model_path` |
 | `merge` | merged model dir | `prune` | `model_path` |
 | `merge` | merged model dir | `eval` | `model_path` |
 | `prune` | pruned model dir | `finetune` (healing) | `base_model` |
-| `finetune` | merged weights | `quant` | `model_path` |
+| `finetune` (after adapter merge) | merged weights dir | `quant` | `model_path` |
 
 **Validation at job creation:**
 - If `quant.imatrix: true` and no `dataset_prep` stage exists in the chain → 400 error
