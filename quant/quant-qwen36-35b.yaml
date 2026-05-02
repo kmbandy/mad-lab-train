@@ -1,0 +1,27 @@
+name: qwen3.6-35b-a3b-instruct
+model_dir: /mnt/hdd/models/Qwen3.6-35B-A3B
+quants:
+  - TQ1_0
+  - TQ2_0
+  - TQ3_1S
+  - TQ4_1S
+imatrix: true
+imatrix_calibration: python-calibration.txt
+output_prefix: qwen3.6-35b-a3b-instruct
+gpu: true
+
+# EC2 launch config
+# NOTE: 35B F16 ~70GB — exceeds single L40S (48GB) VRAM alone.
+# quant.sh imatrix step needs -ngl 999 to split across L40S (48GB) + system RAM (32GB).
+# See comment in quant.sh imatrix step.
+ec2_instance_type: g7e.2xlarge
+ec2_max_spot_price: "1.00"
+ec2_ami: ami-03bda78a7c7c13b45
+ec2_storage_gb: 300
+ec2_key_name: mad-lab-key
+ec2_iam_profile: arn:aws:iam::080869524552:instance-profile/mad-lab-ec2-quant-role
+ec2_vpc_id: vpc-0a8e766998c7d5e23
+ec2_region: us-east-2
+
+# HuggingFace publish config
+# hf_repo: mad-lab-ai/Qwen3.6-35B-A3B-GGUF

@@ -531,7 +531,7 @@ mode_launch() {
     fi
 
     echo ""
-    for VARIANT in "${VARIANTS[@]}"; do
+    for VARIANT in "t75"; do
         echo "[launch] Variant: $VARIANT ..."
         USERDATA_B64=$(mode_userdata "$VARIANT" | base64 -w 0)
 
@@ -568,7 +568,7 @@ mode_launch() {
     echo "=== All 3 instances launched ==="
     echo ""
     echo "Output will appear at:"
-    for VARIANT in "${VARIANTS[@]}"; do
+    for VARIANT in "t75"; do
         echo "  s3://${S3_BUCKET}/${S3_OUTPUT_PREFIX}/${VARIANT}/"
     done
 }
