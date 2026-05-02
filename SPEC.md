@@ -468,6 +468,40 @@ All responses are JSON. Errors return `{"error": "message"}` with appropriate HT
 
 ---
 
+## 4.7 Queue & Scheduling Model
+
+### States
+
+| Status | Meaning |
+|--------|---------|
+| `pending` | Submitted, sitting in list, not queued for execution |
+| `queued` | At the front of the queue (priority 0), waiting for manual start |
+| `running` | Actively executing |
+| `paused` | Paused (clean or force) — waiting for resume |
+| `completed` | Finished successfully |
+| `failed` | Finished with error |
+| `cancelled` | Manually cancelled |
+
+### Queue Rules
+
+- **Manual start always required.** No run ever starts automatically, including scheduled runs and queue-front runs. The queue is a priority ordering only — not an auto-executor.
+- **Priority:** lower integer = higher priority. Default is `100`. `set_as_next: true` sets `priority: 0`.
+- **Tie-breaking:** priority value → `created_at` ascending (earlier submission wins). If two runs share identical priority and identical `created_at` to the millisecond → `409 Conflict`.
+- **`scheduled_for`:** when the scheduled time arrives, the run's priority is set to `0` (moves to front of queue). Still requires manual start. If nothing is running at scheduled time, it remains `pending` at priority 0 — it does not auto-start.
+- **`scheduled_for` and `set_as_next` are mutually exclusive** — both mean "move to front of queue," just different triggers. Supplying both → `400 Bad Request`.
+- Only one run can have `priority: 0` at a time. Setting a new run as next does not error — it sets the existing priority-0 run back to `priority: 1` automatically.
+
+### Dashboard Queue Actions
+
+From the Status tab a queued (pending) run supports:
+- **Start** — starts the run immediately (manual trigger)
+- **Set as Next** — moves to priority 0
+- **Schedule** — set a `scheduled_for` datetime (clears `set_as_next` if set)
+- **Edit Config** — open config form (only available while status = `pending` or `queued`)
+- **Cancel** — remove from queue
+
+---
+
 ## 5. SSE Event Schema
 
 All events are newline-delimited JSON on the `/runs/{id}/stream` endpoint. All events are also written to the `events` table.
@@ -970,12 +1004,75 @@ Always operates on full-precision safetensors. Downloaded from HuggingFace at jo
 
 ### 8.8 eval
 
+All benchmark types produce a normalized score (0–1, higher is better) so the eval gate thresholds uniformly regardless of benchmark type.
+
+**Gate behaviors on failure:**
+- `pause` — run enters `paused` state; user can adjust merge config and re-run the merge stage, override the gate and continue, or abort
+- `abort` — run cancelled immediately
+
+*Future enhancement (not v1):* automatic rollback to previous clean checkpoint with adjusted hyperparameters.
+
 | Field | Type | Default | Required |
 |-------|------|---------|----------|
 | `model_path` | `string` | auto-wired | no |
 | `benchmarks` | `list[BenchmarkConfig]` | — | yes |
 
-**BenchmarkConfig types:** `perplexity`, `mmlu`, `custom`
+**BenchmarkConfig — `perplexity`:**
+
+| Field | Type | Default | Required |
+|-------|------|---------|----------|
+| `type` | `perplexity` | — | yes |
+| `dataset` | `string` | auto-wired from calibration.jsonl | no |
+| `max_samples` | `int` | `200` | no |
+
+Score: `1 / (1 + perplexity)` — normalized so lower perplexity = higher score.
+
+**BenchmarkConfig — `mmlu`:**
+
+| Field | Type | Default | Required |
+|-------|------|---------|----------|
+| `type` | `mmlu` | — | yes |
+| `max_samples` | `int \| null` | `null` (all) | no |
+| `subjects` | `list[string] \| null` | `null` (all) | no |
+
+Score: accuracy (0–1).
+
+**BenchmarkConfig — `tool_use` (stub):**
+
+| Field | Type | Default | Required |
+|-------|------|---------|----------|
+| `type` | `tool_use` | — | yes |
+| `dataset` | `string` | — | yes |
+| `judge_model` | `string \| null` | `null` (exact match only) | no |
+
+Dataset JSONL schema: `{"prompt": "...", "tools": [...], "expected_tool": "...", "expected_params": {...}}`
+
+Score: tool selection + parameter accuracy (0–1). *Execution stubbed in v1.*
+
+**BenchmarkConfig — `conversation` (stub):**
+
+| Field | Type | Default | Required |
+|-------|------|---------|----------|
+| `type` | `conversation` | — | yes |
+| `dataset` | `string` | — | yes |
+| `judge_model` | `string` | — | yes |
+
+Dataset JSONL schema: `{"turns": [{"role": "...", "content": "..."}], "reference_response": "..."}`
+
+Score: LLM-as-judge coherence + helpfulness (0–1). *Execution stubbed in v1.*
+
+**BenchmarkConfig — `coding` (stub):**
+
+| Field | Type | Default | Required |
+|-------|------|---------|----------|
+| `type` | `coding` | — | yes |
+| `dataset` | `string` | — | yes |
+| `language` | `string` | `python` | no |
+| `timeout_seconds` | `int` | `10` | no |
+
+Dataset JSONL schema: `{"prompt": "...", "language": "...", "test_code": "..."}`
+
+Score: pass@1 rate (0–1). *Execution stubbed in v1.*
 
 ### 8.9 convert
 
