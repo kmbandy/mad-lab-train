@@ -4,264 +4,445 @@ This document is the source of truth for the mad-lab-train v2 pipeline server an
 
 **Server:** mad-lab-train FastAPI pipeline server, port 18820  
 **Client:** mad-lab-dash Training Central Command tab  
+**Database:** Local PostgreSQL (same instance the dashboard already uses)  
+**Migrations:** Alembic — all schema changes are versioned migration files  
 
 ---
 
 ## Table of Contents
 
-1. [Data Models](#1-data-models)
-2. [REST API](#2-rest-api)
-3. [SSE Event Schema](#3-sse-event-schema)
-4. [Job YAML Format](#4-job-yaml-format)
-5. [Template Format](#5-template-format)
-6. [Checkpoint Model](#6-checkpoint-model)
-7. [Stage Config Schemas](#7-stage-config-schemas)
+1. [Database Schema](#1-database-schema)
+2. [Alembic Migrations](#2-alembic-migrations)
+3. [Log Retention Policy](#3-log-retention-policy)
+4. [REST API](#4-rest-api)
+5. [SSE Event Schema](#5-sse-event-schema)
+6. [Job YAML Format](#6-job-yaml-format)
+7. [Template Format](#7-template-format)
+8. [Stage Config Schemas](#8-stage-config-schemas)
 
 ---
 
-## 1. Data Models
+## 1. Database Schema
 
-### 1.1 JobStatus
+All pipeline state lives in PostgreSQL. Raw training output goes to files on disk (see §3). The `run_id` field is the primary trace key — it appears in every table so any piece of the system can be joined back to the originating run.
 
-```
-PENDING     — created, not yet queued
-QUEUED      — in queue, waiting for execution (config still editable)
-RUNNING     — actively executing
-PAUSED      — stopped at a checkpoint, ready to resume
-COMPLETED   — all stages finished successfully
-FAILED      — a stage failed; job stopped
-CANCELLED   — user-cancelled before completion
-```
+### 1.1 Enums
 
-### 1.2 StageStatus
+```sql
+CREATE TYPE job_status AS ENUM (
+    'pending', 'queued', 'running', 'paused',
+    'completed', 'failed', 'cancelled'
+);
 
-```
-PENDING     — waiting for previous stage to complete
-RUNNING     — actively executing
-PAUSED      — stopped at checkpoint
-COMPLETED   — finished successfully
-FAILED      — errored out
-SKIPPED     — conditionally skipped (e.g. imatrix disabled)
-```
+CREATE TYPE stage_status AS ENUM (
+    'pending', 'running', 'paused', 'completed', 'failed', 'skipped'
+);
 
-### 1.3 StageType
+CREATE TYPE stage_type AS ENUM (
+    'dataset_prep', 'data_gen', 'finetune', 'pretrain',
+    'quant', 'merge', 'prune', 'eval', 'convert', 'upload'
+);
 
-```
-dataset_prep | data_gen | finetune | pretrain | quant | merge | prune | eval | convert | upload
+CREATE TYPE execution_target AS ENUM ('local', 'ec2');
 ```
 
-Healing Finetune is not a separate stage type — it is `finetune` with `mode: healing` in its config.
+### 1.2 runs
 
-### 1.4 Job
+The top-level job record. One row per job submission.
 
-```json
-{
-  "id":               "uuid",
-  "name":             "string",
-  "template":         "string (template name used, or 'custom')",
-  "status":           "JobStatus",
-  "execution_target": "local | ec2",
-  "ec2_config":       "EC2Config | null",
-  "stages":           "[Stage]",
-  "created_at":       "ISO8601",
-  "queued_at":        "ISO8601 | null",
-  "scheduled_for":    "ISO8601 | null",
-  "started_at":       "ISO8601 | null",
-  "ended_at":         "ISO8601 | null",
-  "priority":         "int (lower = higher priority, default 100)",
-  "error":            "string | null"
-}
+```sql
+CREATE TABLE runs (
+    id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name              TEXT NOT NULL,
+    template_name     TEXT NOT NULL,               -- template used, or 'custom'
+    status            job_status NOT NULL DEFAULT 'pending',
+    execution_target  execution_target NOT NULL DEFAULT 'local',
+    ec2_config        JSONB,                        -- null if local
+    priority          INTEGER NOT NULL DEFAULT 100, -- lower = higher priority
+    scheduled_for     TIMESTAMPTZ,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    queued_at         TIMESTAMPTZ,
+    started_at        TIMESTAMPTZ,
+    ended_at          TIMESTAMPTZ,
+    retain_logs_until TIMESTAMPTZ NOT NULL,         -- computed at creation, see §3
+    error             TEXT
+);
+
+CREATE INDEX idx_runs_status ON runs(status);
+CREATE INDEX idx_runs_created_at ON runs(created_at DESC);
 ```
 
-### 1.5 Stage
+### 1.3 stages
 
-```json
-{
-  "id":           "uuid",
-  "job_id":       "uuid",
-  "sequence":     "int (0-indexed, defines execution order)",
-  "stage_type":   "StageType",
-  "status":       "StageStatus",
-  "config":       "object (stage-specific, see §7)",
-  "input_path":   "string | null (auto-wired from previous stage output_path)",
-  "output_path":  "string | null (set on completion)",
-  "started_at":   "ISO8601 | null",
-  "ended_at":     "ISO8601 | null",
-  "error":        "string | null"
-}
+One row per stage per run. Ordered by `sequence`.
+
+```sql
+CREATE TABLE stages (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    run_id      UUID NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    sequence    INTEGER NOT NULL,                  -- 0-indexed execution order
+    stage_type  stage_type NOT NULL,
+    status      stage_status NOT NULL DEFAULT 'pending',
+    input_path  TEXT,                              -- auto-wired from previous stage
+    output_path TEXT,                              -- set on completion
+    started_at  TIMESTAMPTZ,
+    ended_at    TIMESTAMPTZ,
+    error       TEXT,
+    UNIQUE (run_id, sequence)
+);
+
+CREATE INDEX idx_stages_run_id ON stages(run_id);
 ```
 
-### 1.6 EC2Config
+### 1.4 stage_configs
 
-```json
-{
-  "instance_type":  "string (e.g. g7e.2xlarge)",
-  "max_spot_price": "string (e.g. '1.00')",
-  "ami":            "string",
-  "region":         "string (e.g. us-east-2)",
-  "key_name":       "string",
-  "iam_profile":    "string (ARN)",
-  "vpc_id":         "string",
-  "storage_gb":     "int"
-}
+Stage configuration stored separately so large multi-stage jobs don't bloat the runs or stages rows. One row per stage.
+
+```sql
+CREATE TABLE stage_configs (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    run_id      UUID NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    stage_id    UUID NOT NULL REFERENCES stages(id) ON DELETE CASCADE,
+    stage_type  stage_type NOT NULL,
+    config      JSONB NOT NULL,
+    UNIQUE (stage_id)
+);
+
+CREATE INDEX idx_stage_configs_run_id ON stage_configs(run_id);
 ```
+
+### 1.5 checkpoints
+
+One row per checkpoint saved during execution.
+
+```sql
+CREATE TABLE checkpoints (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    run_id        UUID NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    stage_id      UUID NOT NULL REFERENCES stages(id) ON DELETE CASCADE,
+    sequence      INTEGER NOT NULL,               -- monotonically increasing per stage
+    is_clean      BOOLEAN NOT NULL DEFAULT TRUE,  -- false = force-paused
+    artifact_path TEXT NOT NULL,                  -- directory of saved checkpoint files
+    metadata      JSONB NOT NULL DEFAULT '{}',    -- stage-specific, see §1.7
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (stage_id, sequence)
+);
+
+CREATE INDEX idx_checkpoints_run_id ON checkpoints(run_id);
+CREATE INDEX idx_checkpoints_stage_id ON checkpoints(stage_id);
+```
+
+### 1.6 events
+
+Structured pipeline events. High-frequency events (e.g. training steps) are all stored here; raw unstructured output goes to log files. Rows older than `runs.retain_logs_until` are purged by the cleanup job.
+
+```sql
+CREATE TABLE events (
+    id          BIGSERIAL PRIMARY KEY,
+    run_id      UUID NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    stage_id    UUID REFERENCES stages(id) ON DELETE CASCADE,
+    stage_type  stage_type,
+    event_type  TEXT NOT NULL,
+    data        JSONB NOT NULL DEFAULT '{}',
+    ts          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_events_run_id ON events(run_id);
+CREATE INDEX idx_events_run_id_ts ON events(run_id, ts DESC);
+CREATE INDEX idx_events_stage_id ON events(stage_id);
+```
+
+### 1.7 templates
+
+Pre-built and user-saved chain templates. Pre-built templates are seeded via Alembic migrations (see §2). User-saved templates are inserted at runtime.
+
+```sql
+CREATE TABLE templates (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name        TEXT UNIQUE NOT NULL,              -- slug, no spaces
+    label       TEXT NOT NULL,                     -- display name
+    description TEXT NOT NULL DEFAULT '',
+    chain       JSONB NOT NULL,                    -- ordered list of stage type + defaults
+    is_builtin  BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+### 1.8 Checkpoint Metadata by Stage Type
+
+The `metadata` JSONB column in `checkpoints` contains stage-specific fields:
+
+| stage_type | metadata fields |
+|------------|----------------|
+| `finetune` / `pretrain` | `step`, `epoch`, `train_loss`, `eval_loss` |
+| `data_gen` | `samples_completed`, `total_samples` |
+| `dataset_prep` | `sources_completed`, `total_sources`, `records_written` |
+| `quant` | `quant_types_completed`, `current_quant_type` |
+| `prune` | `layers_pruned`, `total_layers` |
+| `eval` | `benchmarks_completed`, `total_benchmarks` |
 
 ---
 
-## 2. REST API
+## 2. Alembic Migrations
+
+All schema changes are version-controlled as Alembic migration files in `mad-lab-train/alembic/versions/`. This is the source of truth for the database schema — no manual DDL, no undocumented changes.
+
+### 2.1 File Structure
+
+```
+mad-lab-train/
+  alembic/
+    env.py
+    script.py.mako
+    versions/
+      0001_initial_schema.py          -- enums + all tables
+      0002_seed_builtin_templates.py  -- 6 pre-built templates
+      0003_...                        -- future changes
+  alembic.ini
+```
+
+### 2.2 Usage
+
+```bash
+# Apply all pending migrations
+alembic upgrade head
+
+# Roll back one migration
+alembic downgrade -1
+
+# Create a new migration
+alembic revision -m "add_eval_results_table"
+
+# Check current state
+alembic current
+```
+
+### 2.3 Template Migrations
+
+Pre-built templates are seeded in migration `0002_seed_builtin_templates.py` as `INSERT INTO templates` statements. This means:
+
+- Template additions → new migration with `INSERT`
+- Template edits → new migration with `UPDATE`
+- Template removals → new migration with `DELETE WHERE is_builtin = TRUE AND name = '...'`
+
+Every template change has a git commit, a migration number, and is fully reversible via `downgrade()`.
+
+Example migration structure:
+
+```python
+# 0002_seed_builtin_templates.py
+
+def upgrade():
+    op.execute("""
+        INSERT INTO templates (name, label, description, chain, is_builtin) VALUES
+        ('gguf_quant', 'GGUF Quant',
+         'Dataset prep and GGUF quantization with optional imatrix',
+         '[{"stage_type": "dataset_prep", "defaults": {...}},
+           {"stage_type": "quant", "defaults": {...}}]',
+         TRUE),
+        ('full_finetune', 'Full Finetune',
+         'Dataset prep → data generation → QLoRA finetune → GGUF quant',
+         '[{"stage_type": "dataset_prep", "defaults": {...}},
+           {"stage_type": "data_gen", "defaults": {...}},
+           {"stage_type": "finetune", "defaults": {...}},
+           {"stage_type": "quant", "defaults": {...}}]',
+         TRUE)
+        -- ... remaining 4 templates
+    """)
+
+def downgrade():
+    op.execute("DELETE FROM templates WHERE is_builtin = TRUE")
+```
+
+### 2.4 Pre-built Templates (seeded in 0002)
+
+| name | label | chain |
+|------|-------|-------|
+| `gguf_quant` | GGUF Quant | dataset_prep → quant |
+| `full_finetune` | Full Finetune | dataset_prep → data_gen → finetune → quant |
+| `from_scratch` | From Scratch | dataset_prep → data_gen → pretrain → quant |
+| `prune` | Prune | dataset_prep → data_gen → prune → finetune (healing) |
+| `merge` | Merge | dataset_prep → data_gen → merge → eval → prune → finetune (healing) |
+| `eval_standalone` | Eval Standalone | eval |
+
+---
+
+## 3. Log Retention Policy
+
+### 3.1 Structured Events (Postgres)
+
+All structured events are stored in the `events` table. `runs.retain_logs_until` is computed at job creation based on stage types in the run.
+
+**Retention by stage type (after job ends):**
+
+| Stage Type(s) in Run | Retention After Completion |
+|----------------------|---------------------------|
+| `pretrain` (From Scratch) | 14 days |
+| `finetune`, `prune` | 14 days |
+| `data_gen`, `dataset_prep` | 7 days |
+| `quant`, `merge`, `convert` | 7 days |
+| `eval`, `upload` | 3 days |
+
+When a run contains multiple stage types, the longest applicable retention window wins.
+
+**Hard rules (override all thresholds):**
+- Never purge events for a run with status `running` or `paused`
+- Never purge events for a run where `ended_at IS NULL`
+- `retain_logs_until` is recomputed and extended on every checkpoint, so a long-running From Scratch job that takes 3 weeks never loses its logs mid-run
+
+**Cleanup job:** runs daily at 3 AM via systemd timer.
+
+```sql
+-- Cleanup query (run daily)
+DELETE FROM events
+WHERE run_id IN (
+    SELECT id FROM runs
+    WHERE retain_logs_until < now()
+    AND status NOT IN ('running', 'paused')
+    AND ended_at IS NOT NULL
+);
+```
+
+### 3.2 Raw Log Files (Disk)
+
+Unstructured training output (full stdout/stderr from training processes) written to:
+
+```
+~/.mad-lab-train/logs/{run_id}/{stage_id}.log
+```
+
+These are tailed by the dashboard log panel. Cleaned up on the same schedule as events — the cleanup job deletes the log directory for a run when its `retain_logs_until` threshold passes.
+
+---
+
+## 4. REST API
 
 Base URL: `http://localhost:18820`
 
 All responses are JSON. Errors return `{"error": "message"}` with appropriate HTTP status.
 
-### 2.1 Jobs
+### 4.1 Runs
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/jobs` | Create and queue a job |
-| `GET` | `/jobs` | List all jobs |
-| `GET` | `/jobs/{id}` | Get full job detail |
-| `PATCH` | `/jobs/{id}` | Update job config (QUEUED only) |
-| `DELETE` | `/jobs/{id}` | Delete job (QUEUED or terminal state only) |
+| `POST` | `/runs` | Create and queue a run |
+| `GET` | `/runs` | List all runs |
+| `GET` | `/runs/{id}` | Get full run detail (includes stages + configs) |
+| `PATCH` | `/runs/{id}` | Update run config (queued status only) |
+| `DELETE` | `/runs/{id}` | Delete run (queued or terminal state only) |
 
-**POST /jobs — Request**
+**POST /runs — Request**
 ```json
 {
-  "name":             "string",
-  "template":         "string",
-  "execution_target": "local | ec2",
-  "ec2_config":       "EC2Config | null",
-  "stages":           "[StageConfig]",
-  "scheduled_for":    "ISO8601 | null",
+  "name":              "string",
+  "template_name":     "string",
+  "execution_target":  "local | ec2",
+  "ec2_config":        "EC2Config | null",
+  "stages":            "[{stage_type, config}]",
+  "scheduled_for":     "ISO8601 | null",
   "start_immediately": "bool (default false)",
-  "set_as_next":      "bool (default false)"
+  "set_as_next":       "bool (default false)"
 }
 ```
 
-**POST /jobs — Response: 201**
+**POST /runs — Response: 201**
 ```json
-{ "job": "Job" }
+{ "run": "Run" }
 ```
 
-**GET /jobs — Query params:** `status`, `limit` (default 50), `offset` (default 0)  
-**GET /jobs — Response: 200**
-```json
-{ "jobs": "[Job]", "total": "int" }
-```
+**GET /runs — Query params:** `status`, `limit` (default 50), `offset` (default 0)
 
-**GET /jobs/{id} — Response: 200**
-```json
-{ "job": "Job" }
-```
-
-**PATCH /jobs/{id} — Request** (QUEUED state only)
+**GET /runs/{id} — Response: 200**
 ```json
 {
-  "name":             "string | omit",
-  "execution_target": "local | ec2 | omit",
-  "ec2_config":       "EC2Config | null | omit",
-  "stages":           "[StageConfig] | omit"
+  "run": "Run",
+  "stages": "[Stage]",
+  "configs": "[StageConfig]"
 }
 ```
 
-### 2.2 Job Control
+### 4.2 Run Control
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/jobs/{id}/start` | Start a QUEUED job immediately |
-| `POST` | `/jobs/{id}/cancel` | Cancel a RUNNING or QUEUED job |
-| `POST` | `/jobs/{id}/pause` | Request clean pause (runs to next checkpoint) |
-| `POST` | `/jobs/{id}/force-pause` | Immediate stop (resumes from previous checkpoint) |
-| `POST` | `/jobs/{id}/resume` | Resume a PAUSED job |
-| `POST` | `/jobs/{id}/priority` | Set queue priority |
-| `POST` | `/jobs/{id}/schedule` | Set or update scheduled start time |
+| `POST` | `/runs/{id}/start` | Start a queued run immediately |
+| `POST` | `/runs/{id}/cancel` | Cancel a running or queued run |
+| `POST` | `/runs/{id}/pause` | Clean pause (runs to next checkpoint then stops) |
+| `POST` | `/runs/{id}/force-pause` | Immediate stop — resumes from previous clean checkpoint |
+| `POST` | `/runs/{id}/resume` | Resume a paused run |
+| `POST` | `/runs/{id}/priority` | Set queue priority |
+| `POST` | `/runs/{id}/schedule` | Set or update scheduled start time |
 
-**POST /jobs/{id}/resume — Request**
+**POST /runs/{id}/resume — Request**
 ```json
 { "checkpoint_id": "uuid | null (null = most recent clean checkpoint)" }
 ```
 
-**POST /jobs/{id}/priority — Request**
+**POST /runs/{id}/priority — Request**
 ```json
 { "priority": "int" }
 ```
 
-**POST /jobs/{id}/schedule — Request**
+**POST /runs/{id}/schedule — Request**
 ```json
 { "scheduled_for": "ISO8601 | null (null clears schedule)" }
 ```
 
-### 2.3 Streams & Logs
+### 4.3 Streams, Logs & Checkpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/jobs/{id}/stream` | SSE event stream (live) |
-| `GET` | `/jobs/{id}/logs` | Raw log tail |
-| `GET` | `/jobs/{id}/checkpoints` | List all checkpoints for a job |
+| `GET` | `/runs/{id}/stream` | SSE event stream (live) |
+| `GET` | `/runs/{id}/logs` | Raw log tail |
+| `GET` | `/runs/{id}/checkpoints` | List all checkpoints |
 
-**GET /jobs/{id}/logs — Query params:** `lines` (default 100), `stage_id` (optional filter)
+**GET /runs/{id}/logs — Query params:** `lines` (default 100), `stage_id` (optional filter)
 
-**GET /jobs/{id}/checkpoints — Response: 200**
+**GET /runs/{id}/checkpoints — Response: 200**
 ```json
 { "checkpoints": "[Checkpoint]" }
 ```
 
-### 2.4 Templates
+### 4.4 Templates
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/templates` | List all templates (pre-built + custom) |
+| `GET` | `/templates` | List all templates (builtin + custom) |
 | `GET` | `/templates/{name}` | Get template detail |
 | `POST` | `/templates` | Save a custom template |
-| `DELETE` | `/templates/{name}` | Delete a custom template (pre-built protected) |
-
-**GET /templates — Response: 200**
-```json
-{
-  "templates": [
-    {
-      "name":        "string",
-      "label":       "string (display name)",
-      "description": "string",
-      "chain":       "[StageType]",
-      "is_builtin":  "bool",
-      "created_at":  "ISO8601 | null"
-    }
-  ]
-}
-```
+| `DELETE` | `/templates/{name}` | Delete custom template (builtin protected) |
 
 **POST /templates — Request**
 ```json
 {
-  "name":        "string (slug, no spaces)",
+  "name":        "string (slug)",
   "label":       "string",
   "description": "string",
-  "stages":      "[StageConfig]"
+  "chain":       "[{stage_type, defaults}]"
 }
 ```
 
-### 2.5 Hardware & Health
+### 4.5 Hardware & Health
 
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/hardware` | Current hardware stats |
-| `GET` | `/health` | Server health check |
+| `GET` | `/health` | Server health + DB connectivity check |
 
 **GET /hardware — Response: 200**
 ```json
 {
-  "gpu": [
+  "gpus": [
     {
-      "index":     "int",
-      "name":      "string",
-      "vram_used_gb": "float",
-      "vram_total_gb": "float",
+      "index":           "int",
+      "name":            "string",
+      "vram_used_gb":    "float",
+      "vram_total_gb":   "float",
       "utilization_pct": "int"
     }
   ],
-  "cpu_pct":    "float",
-  "ram_used_gb": "float",
+  "cpu_pct":      "float",
+  "ram_used_gb":  "float",
   "ram_total_gb": "float",
   "disk_free_gb": "float"
 }
@@ -269,55 +450,55 @@ All responses are JSON. Errors return `{"error": "message"}` with appropriate HT
 
 **GET /health — Response: 200**
 ```json
-{ "status": "ok", "version": "2.0.0" }
+{
+  "status":   "ok",
+  "version":  "2.0.0",
+  "db":       "connected | error"
+}
 ```
 
-### 2.6 EC2
+### 4.6 EC2
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `POST` | `/ec2/launch` | Launch spot instance for a job |
+| `POST` | `/ec2/launch` | Launch spot instance for a run |
 | `GET` | `/ec2/spot-price` | Current spot price for instance type |
 
-**GET /ec2/spot-price — Query params:** `instance_type`, `region`  
-**GET /ec2/spot-price — Response: 200**
-```json
-{ "instance_type": "string", "region": "string", "price_usd": "float" }
-```
+**GET /ec2/spot-price — Query params:** `instance_type`, `region`
 
 ---
 
-## 3. SSE Event Schema
+## 5. SSE Event Schema
 
-All events are newline-delimited JSON on the `/jobs/{id}/stream` endpoint.
+All events are newline-delimited JSON on the `/runs/{id}/stream` endpoint. All events are also written to the `events` table.
 
-### 3.1 Base Event Shape
+### 5.1 Base Event Shape
 
 ```json
 {
-  "job_id":     "uuid",
+  "run_id":     "uuid",
   "stage_id":   "uuid | null",
-  "stage_type": "StageType | null",
+  "stage_type": "stage_type | null",
   "event_type": "string",
-  "timestamp":  "ISO8601",
+  "ts":         "ISO8601",
   "data":       "object"
 }
 ```
 
-### 3.2 Job-Level Events
+### 5.2 Run-Level Events
 
 | event_type | data |
 |------------|------|
-| `job_started` | `{}` |
-| `job_completed` | `{}` |
-| `job_failed` | `{"error": "string"}` |
-| `job_cancelled` | `{}` |
-| `job_paused` | `{"checkpoint_id": "uuid", "is_clean": true}` |
-| `job_resumed` | `{"checkpoint_id": "uuid"}` |
+| `run_started` | `{}` |
+| `run_completed` | `{}` |
+| `run_failed` | `{"error": "string"}` |
+| `run_cancelled` | `{}` |
+| `run_paused` | `{"checkpoint_id": "uuid", "is_clean": bool}` |
+| `run_resumed` | `{"checkpoint_id": "uuid"}` |
 | `pause_requested` | `{}` |
 | `force_pause_requested` | `{}` |
 
-### 3.3 Stage-Level Events (all stage types)
+### 5.3 Stage-Level Events (all stage types)
 
 | event_type | data |
 |------------|------|
@@ -327,7 +508,7 @@ All events are newline-delimited JSON on the `/jobs/{id}/stream` endpoint.
 | `stage_skipped` | `{"reason": "string"}` |
 | `checkpoint` | `{"checkpoint_id": "uuid", "sequence": int, "metadata": object}` |
 
-### 3.4 Finetune / Pretrain Events
+### 5.4 Finetune / Pretrain
 
 | event_type | data |
 |------------|------|
@@ -335,9 +516,9 @@ All events are newline-delimited JSON on the `/jobs/{id}/stream` endpoint.
 | `eval` | `{"step": int, "eval_loss": float, "perplexity": float}` |
 | `epoch_end` | `{"epoch": int, "train_loss": float, "eval_loss": float}` |
 | `vram` | `{"used_gb": float, "total_gb": float}` |
-| `tokenizer_trained` | `{"vocab_size": int}` (pretrain only) |
+| `tokenizer_trained` | `{"vocab_size": int}` *(pretrain only)* |
 
-### 3.5 Data Generation Events
+### 5.5 Data Generation
 
 | event_type | data |
 |------------|------|
@@ -345,7 +526,7 @@ All events are newline-delimited JSON on the `/jobs/{id}/stream` endpoint.
 | `sample_filtered` | `{"reason": "string", "score": float}` |
 | `quality_score` | `{"score": float, "threshold": float, "passed": bool}` |
 
-### 3.6 Dataset Prep Events
+### 5.6 Dataset Prep
 
 | event_type | data |
 |------------|------|
@@ -353,7 +534,7 @@ All events are newline-delimited JSON on the `/jobs/{id}/stream` endpoint.
 | `records_processed` | `{"count": int, "source_name": "string"}` |
 | `source_complete` | `{"source_name": "string", "total_records": int}` |
 
-### 3.7 Quantization Events
+### 5.7 Quantization
 
 | event_type | data |
 |------------|------|
@@ -361,14 +542,14 @@ All events are newline-delimited JSON on the `/jobs/{id}/stream` endpoint.
 | `quant_progress` | `{"quant_type": "string", "percent": float}` |
 | `quant_complete` | `{"quant_type": "string", "output_path": "string", "size_gb": float}` |
 
-### 3.8 Prune Events
+### 5.8 Prune
 
 | event_type | data |
 |------------|------|
 | `importance_scored` | `{"method": "string"}` |
 | `layer_pruned` | `{"layer_idx": int, "total_layers": int, "params_removed": int}` |
 
-### 3.9 Evaluation Events
+### 5.9 Evaluation
 
 | event_type | data |
 |------------|------|
@@ -377,7 +558,7 @@ All events are newline-delimited JSON on the `/jobs/{id}/stream` endpoint.
 | `benchmark_complete` | `{"name": "string", "score": float, "metric": "string"}` |
 | `gate_result` | `{"passed": bool, "score": float, "threshold": float}` |
 
-### 3.10 Merge / Convert / Upload Events
+### 5.10 Merge / Convert / Upload
 
 | event_type | data |
 |------------|------|
@@ -386,7 +567,7 @@ All events are newline-delimited JSON on the `/jobs/{id}/stream` endpoint.
 | `upload_progress` | `{"bytes_sent": int, "total_bytes": int}` |
 | `upload_complete` | `{"repo_url": "string"}` |
 
-### 3.11 EC2 Events
+### 5.11 EC2
 
 | event_type | data |
 |------------|------|
@@ -396,18 +577,18 @@ All events are newline-delimited JSON on the `/jobs/{id}/stream` endpoint.
 
 ---
 
-## 4. Job YAML Format
+## 6. Job YAML Format
 
-A single YAML file defines a complete job. Omit any section to skip it.
+A single YAML file per run. Used for job submission and config storage (the parsed result is stored in `stage_configs`). Omit any stage section to skip it.
 
 ```yaml
 meta:
-  name: "string"                  # job display name
-  template: "string"              # template this was created from (or 'custom')
+  name: "string"
+  template: "string"
 
 execution:
-  target: local                   # local | ec2
-  ec2:                            # required if target: ec2
+  target: local                    # local | ec2
+  ec2:                             # required if target: ec2
     instance_type: g7e.2xlarge
     max_spot_price: "1.00"
     ami: ami-03bda78a7c7c13b45
@@ -441,31 +622,38 @@ stages:
           path: ~/datasets/custom.jsonl
       train_split: 0.9
       deduplicate: true
-      output_dir: ~/jobs/job-name/dataset
 
   - type: data_gen
     config:
-      endpoint: "http://localhost:8080/v1"
-      model: default
+      model: "unsloth/Qwen3-30B-A3B-GGUF"    # HF model ID — pulled by each worker
       system_prompt: "You are a helpful assistant."
       user_template: "Answer this question: {{ question }}"
-      samples: 1000
-      concurrency: 4
+      samples: 10000
       temperature: 0.85
       max_tokens: 512
+      ctx_size: 2048
       quality_threshold: 0.7
-      judge_endpoint: "http://localhost:8080/v1"
-      judge_model: default
-      cross_review: false
-      output_dir: ~/jobs/job-name/generated
+      judge_model: ~                           # null = skip quality judging
+      workers:
+        - type: local
+          host: mad-lab-main
+          port: 8080
+          parallel: 64
+        - type: local
+          host: mad-lab
+          port: 8080
+          parallel: 64
+        - type: ec2                            # optional — omit to skip EC2 spoke
+          instance_type: g6.4xlarge
+          max_spot_price: "0.80"
+          parallel: 300
+          llama_cpp_s3: "s3://mad-lab/llama-cpp/llama-cpp-linux-cuda-b5000.tar.gz"
 
   - type: finetune
     config:
-      mode: standard                # standard | healing
+      mode: standard               # standard | healing
       base_model: /path/to/model
-      dataset: ~/jobs/job-name/dataset/train.jsonl
-      eval_dataset: ~/jobs/job-name/dataset/eval.jsonl
-      output_dir: ~/jobs/job-name/adapter
+      gpu_target: auto             # auto | r9700 | 6900xt (local only; ignored on EC2)
       lora:
         r: 16
         alpha: 32
@@ -490,204 +678,157 @@ stages:
   - type: pretrain
     config:
       architecture: /path/to/arch.json
-      tokenizer_corpus: ~/jobs/job-name/dataset/train.jsonl
       vocab_size: 32000
-      dataset: ~/jobs/job-name/dataset/train.jsonl
-      eval_dataset: ~/jobs/job-name/dataset/eval.jsonl
-      output_dir: ~/jobs/job-name/model
+      multi_gpu: false             # true = DeepSpeed ZeRO-2 across R9700+6900XT
+      deepspeed_zero_stage: 2     # 1|2|3 — only used when multi_gpu: true
+      gpu_target: auto             # auto | r9700 | 6900xt — only used when multi_gpu: false
       training:
-        # same fields as finetune.training above
+        # same fields as finetune.training
 
   - type: quant
     config:
-      model_path: /path/to/model
-      output_dir: ~/jobs/job-name/quants
+      model_path: /path/to/model   # omit to auto-wire from previous stage
       output_prefix: my-model
-      quant_types:
-        - Q4_K_M
-        - Q5_K_M
-        - TQ3_1S
+      quant_types: [Q4_K_M, Q5_K_M, TQ3_1S]
       imatrix: false
-      imatrix_dataset: ~/jobs/job-name/dataset/train.jsonl  # required if imatrix: true
+      imatrix_dataset: ~           # required if imatrix: true; auto-wired if dataset_prep present
 
   - type: merge
     config:
       base_model: /path/to/base
-      adapter_path: ~/jobs/job-name/adapter
-      output_dir: ~/jobs/job-name/merged
+      adapter_path: ~              # auto-wired from finetune output
       eval_gate:
         enabled: true
         benchmark: perplexity
-        threshold: 15.0          # fail if perplexity > threshold
-        on_fail: pause           # pause | abort
+        threshold: 15.0
+        on_fail: pause             # pause | abort
 
   - type: prune
     config:
-      model_path: /path/to/model
-      method: shorthgpt          # llm_pruner | shortgpt | slicegpt | wanda
-      pruning_ratio: 0.2         # fraction of parameters to remove
-      calibration_dataset: ~/jobs/job-name/dataset/train.jsonl
-      output_dir: ~/jobs/job-name/pruned
+      model_source: huggingface    # huggingface | local
+      model_id: "org/model-name"   # required if model_source: huggingface
+      model_path: ~                # required if model_source: local (or auto-wired from merge)
+      method: wanda                # wanda (default) | llm_pruner
+      pruning_ratio: 0.2
+      calibration_dataset: ~       # auto-wired from dataset_prep
+      llm_pruner:                  # only used when method: llm_pruner
+        block_wise: true
+        weight_pager: null         # future: NVMe→VRAM pager (WeightPager protocol)
 
   - type: eval
     config:
-      model_path: /path/to/model
+      model_path: ~                # auto-wired
       benchmarks:
         - type: perplexity
-          dataset: ~/jobs/job-name/dataset/eval.jsonl
         - type: mmlu
           max_samples: 500
         - type: custom
-          dataset: ~/jobs/job-name/dataset/eval.jsonl
           metric: exact_match
-      output_dir: ~/jobs/job-name/eval
 
   - type: convert
     config:
-      input_path: /path/to/model
-      output_path: ~/jobs/job-name/converted
-      format: gguf_f16           # gguf_f16 | gguf_bf16 | safetensors_fp32
+      input_path: ~                # auto-wired
+      format: gguf_f16             # gguf_f16 | gguf_bf16 | safetensors_fp32
 
   - type: upload
     config:
-      source_path: ~/jobs/job-name/quants
+      source_path: ~               # auto-wired
       hf_repo: "org/model-name"
-      visibility: public         # public | private
+      visibility: public
       generate_model_card: true
 ```
 
 ---
 
-## 5. Template Format
+## 7. Template Format
 
-Templates are YAML files stored in `mad-lab-train/templates/`.  
-Pre-built templates: `templates/builtin/`  
-Custom templates: `templates/custom/`
+Templates are stored in the `templates` table. Pre-built templates are seeded via Alembic migration `0002_seed_builtin_templates.py`. User-saved templates are inserted at runtime via `POST /templates`.
 
-```yaml
-# templates/builtin/full_finetune.yaml
-meta:
-  name: full_finetune
-  label: "Full Finetune"
-  description: "Dataset prep → data generation → QLoRA finetune → GGUF quant"
-  is_builtin: true
-
-stages:
-  - type: dataset_prep
-    defaults:
-      train_split: 0.9
-      deduplicate: true
-
-  - type: data_gen
-    defaults:
-      samples: 1000
-      concurrency: 4
-      temperature: 0.85
-      quality_threshold: 0.7
-
-  - type: finetune
-    defaults:
-      mode: standard
-      lora:
-        r: 16
-        alpha: 32
-        dropout: 0.05
-        target_modules: all-linear
-      training:
-        epochs: 3
-        micro_batch_size: 1
-        gradient_accumulation_steps: 16
-        learning_rate: 2.0e-4
-
-  - type: quant
-    defaults:
-      quant_types: [Q4_K_M]
-      imatrix: false
-```
-
-**Pre-built templates (6):**
-
-| File | Label | Chain |
-|------|-------|-------|
-| `gguf_quant.yaml` | GGUF Quant | dataset_prep → quant |
-| `full_finetune.yaml` | Full Finetune | dataset_prep → data_gen → finetune → quant |
-| `from_scratch.yaml` | From Scratch | dataset_prep → data_gen → pretrain → quant |
-| `prune.yaml` | Prune | dataset_prep → data_gen → prune → finetune (healing) |
-| `merge.yaml` | Merge | dataset_prep → data_gen → merge → eval → prune → finetune (healing) |
-| `eval_standalone.yaml` | Eval Standalone | eval |
-
----
-
-## 6. Checkpoint Model
+The `chain` JSONB column holds an ordered array of stage definitions with their defaults:
 
 ```json
-{
-  "id":           "uuid",
-  "job_id":       "uuid",
-  "stage_id":     "uuid",
-  "sequence":     "int (monotonically increasing per stage)",
-  "created_at":   "ISO8601",
-  "is_clean":     "bool (false = force-paused, may have incomplete artifacts)",
-  "artifact_path": "string (directory containing checkpoint files)",
-  "metadata":     "object (stage-specific, see below)"
-}
+[
+  {
+    "stage_type": "dataset_prep",
+    "defaults": {
+      "train_split": 0.9,
+      "deduplicate": true
+    }
+  },
+  {
+    "stage_type": "finetune",
+    "defaults": {
+      "mode": "standard",
+      "lora": { "r": 16, "alpha": 32, "dropout": 0.05, "target_modules": "all-linear" },
+      "training": { "epochs": 3, "learning_rate": 2e-4 }
+    }
+  }
+]
 ```
 
-**Metadata per stage type:**
-
-| Stage | Metadata fields |
-|-------|----------------|
-| `finetune` / `pretrain` | `step`, `epoch`, `train_loss`, `eval_loss` |
-| `data_gen` | `samples_completed`, `total_samples` |
-| `dataset_prep` | `sources_completed`, `total_sources`, `records_written` |
-| `quant` | `quant_types_completed`, `current_quant_type` |
-| `prune` | `layers_pruned`, `total_layers` |
-| `eval` | `benchmarks_completed`, `total_benchmarks` |
+The wizard reads the template's `chain` array to determine how many steps to show and pre-populate field defaults.
 
 ---
 
-## 7. Stage Config Schemas
+## 8. Stage Config Schemas
 
-This section documents every field for each stage type with types and defaults.
+Full field reference for each stage type. All fields stored as JSONB in `stage_configs.config`.
 
-### 7.1 dataset_prep
+### 8.1 dataset_prep
 
 | Field | Type | Default | Required |
 |-------|------|---------|----------|
 | `sources` | `list[SourceConfig]` | — | yes |
 | `train_split` | `float` | `0.9` | no |
 | `deduplicate` | `bool` | `true` | no |
-| `output_dir` | `string` | auto | no |
 
 **SourceConfig types:** `huggingface`, `zim`, `qdrant`, `duckdb`, `raw`
 
-### 7.2 data_gen
+### 8.2 data_gen
+
+Data gen always runs as hub-and-spoke from mad-lab-main regardless of run `execution_target`. See §9.3.
 
 | Field | Type | Default | Required |
 |-------|------|---------|----------|
-| `endpoint` | `string` | — | yes |
-| `model` | `string` | `default` | no |
+| `model` | `string` | — | yes |
 | `system_prompt` | `string` | — | yes |
 | `user_template` | `string` | — | yes |
 | `samples` | `int` | `1000` | no |
-| `concurrency` | `int` | `4` | no |
 | `temperature` | `float` | `0.85` | no |
 | `max_tokens` | `int` | `512` | no |
-| `quality_threshold` | `float 0-1` | `0.7` | no |
-| `judge_endpoint` | `string` | same as `endpoint` | no |
-| `judge_model` | `string` | same as `model` | no |
-| `cross_review` | `bool` | `false` | no |
-| `output_dir` | `string` | auto | no |
+| `ctx_size` | `int` | `2048` | no |
+| `quality_threshold` | `float 0–1` | `0.7` | no |
+| `judge_model` | `string \| null` | `null` | no |
+| `workers` | `list[WorkerConfig]` | — | yes |
 
-### 7.3 finetune
+**WorkerConfig — local:**
+
+| Field | Type | Default | Required |
+|-------|------|---------|----------|
+| `type` | `local` | — | yes |
+| `host` | `string` | — | yes |
+| `port` | `int` | `8080` | no |
+| `parallel` | `int` | `50` | no |
+
+**WorkerConfig — ec2:**
+
+| Field | Type | Default | Required |
+|-------|------|---------|----------|
+| `type` | `ec2` | — | yes |
+| `instance_type` | `string` | — | yes |
+| `max_spot_price` | `string` | — | yes |
+| `parallel` | `int` | `300` | no |
+| `llama_cpp_s3` | `string` | — | yes |
+
+### 8.3 finetune
+
+QLoRA via TRL SFTTrainer + PEFT. Always single-GPU. See §9.2.
 
 | Field | Type | Default | Required |
 |-------|------|---------|----------|
 | `mode` | `standard \| healing` | `standard` | no |
 | `base_model` | `string` | — | yes |
-| `dataset` | `string` | auto-wired | no |
-| `eval_dataset` | `string` | auto-wired | no |
-| `output_dir` | `string` | auto | no |
+| `gpu_target` | `auto \| r9700 \| 6900xt` | `auto` | no |
 | `lora.r` | `int` | `16` | no |
 | `lora.alpha` | `int` | `32` | no |
 | `lora.dropout` | `float` | `0.05` | no |
@@ -707,68 +848,73 @@ This section documents every field for each stage type with types and defaults.
 | `training.save_steps` | `int` | `100` | no |
 | `training.logging_steps` | `int` | `10` | no |
 
-### 7.4 pretrain
+### 8.4 pretrain
 
-Same as `finetune` plus:
+Full weight training. Supports DeepSpeed ZeRO-2 multi-GPU or single-GPU. See §9.2.
+
+Same as `finetune` training fields plus:
 
 | Field | Type | Default | Required |
 |-------|------|---------|----------|
 | `architecture` | `string (path to arch JSON)` | — | yes |
-| `tokenizer_corpus` | `string` | auto-wired | no |
 | `vocab_size` | `int` | `32000` | no |
+| `multi_gpu` | `bool` | `false` | no |
+| `deepspeed_zero_stage` | `int 1\|2\|3` | `2` | no (multi_gpu only) |
+| `gpu_target` | `auto \| r9700 \| 6900xt` | `auto` | no (single GPU only) |
 
-### 7.5 quant
+### 8.5 quant
 
 | Field | Type | Default | Required |
 |-------|------|---------|----------|
 | `model_path` | `string` | auto-wired | no |
-| `output_dir` | `string` | auto | no |
-| `output_prefix` | `string` | job name | no |
+| `output_prefix` | `string` | run name | no |
 | `quant_types` | `list[string]` | `[Q4_K_M]` | no |
 | `imatrix` | `bool` | `false` | no |
 | `imatrix_dataset` | `string` | auto-wired if imatrix true | no |
 
-### 7.6 merge
+### 8.6 merge
 
 | Field | Type | Default | Required |
 |-------|------|---------|----------|
 | `base_model` | `string` | — | yes |
 | `adapter_path` | `string` | auto-wired | no |
-| `output_dir` | `string` | auto | no |
 | `eval_gate.enabled` | `bool` | `false` | no |
 | `eval_gate.benchmark` | `string` | `perplexity` | no |
 | `eval_gate.threshold` | `float` | — | if gate enabled |
 | `eval_gate.on_fail` | `pause \| abort` | `pause` | no |
 
-### 7.7 prune
+### 8.7 prune
+
+Always operates on full-precision safetensors. Downloaded from HuggingFace at job time if `model_source: huggingface`. See §9.4.
 
 | Field | Type | Default | Required |
 |-------|------|---------|----------|
-| `model_path` | `string` | auto-wired | no |
-| `method` | `llm_pruner \| shortgpt \| slicegpt \| wanda` | `shortgpt` | no |
-| `pruning_ratio` | `float 0-1` | `0.2` | no |
+| `model_source` | `huggingface \| local` | `huggingface` | no |
+| `model_id` | `string` | — | if model_source=huggingface |
+| `model_path` | `string` | auto-wired | if model_source=local |
+| `method` | `wanda \| llm_pruner` | `wanda` | no |
+| `pruning_ratio` | `float 0–1` | `0.2` | no |
 | `calibration_dataset` | `string` | auto-wired | no |
-| `output_dir` | `string` | auto | no |
+| `llm_pruner.block_wise` | `bool` | `true` | no (llm_pruner only) |
+| `llm_pruner.weight_pager` | `string \| null` | `null` | no (llm_pruner only) |
 
-### 7.8 eval
+### 8.8 eval
 
 | Field | Type | Default | Required |
 |-------|------|---------|----------|
 | `model_path` | `string` | auto-wired | no |
 | `benchmarks` | `list[BenchmarkConfig]` | — | yes |
-| `output_dir` | `string` | auto | no |
 
 **BenchmarkConfig types:** `perplexity`, `mmlu`, `custom`
 
-### 7.9 convert
+### 8.9 convert
 
 | Field | Type | Default | Required |
 |-------|------|---------|----------|
 | `input_path` | `string` | auto-wired | no |
-| `output_path` | `string` | auto | no |
 | `format` | `gguf_f16 \| gguf_bf16 \| safetensors_fp32` | `gguf_f16` | no |
 
-### 7.10 upload
+### 8.10 upload
 
 | Field | Type | Default | Required |
 |-------|------|---------|----------|
@@ -779,28 +925,144 @@ Same as `finetune` plus:
 
 ---
 
-## Auto-Wiring Rules
+## 9. Compute Architecture
 
-When stages are chained, outputs are automatically wired to inputs:
+### 9.1 Machine Topology
 
-| Producing Stage | Output | Consuming Stage | Auto-wired Field |
-|----------------|--------|-----------------|-----------------|
-| `dataset_prep` | `output_dir/train.jsonl` | `data_gen` | `input_path` |
-| `dataset_prep` | `output_dir/train.jsonl` | `finetune` | `dataset` |
-| `dataset_prep` | `output_dir/eval.jsonl` | `finetune` | `eval_dataset` |
-| `dataset_prep` | `output_dir/train.jsonl` | `quant` | `imatrix_dataset` |
-| `dataset_prep` | `output_dir/train.jsonl` | `prune` | `calibration_dataset` |
-| `dataset_prep` | `output_dir/eval.jsonl` | `eval` | benchmark dataset |
-| `data_gen` | `output_dir/train.jsonl` | `finetune` | `dataset` (if dataset_prep absent) |
-| `finetune` | `output_dir` (adapter) | `merge` | `adapter_path` |
-| `pretrain` | `output_dir` | `quant` | `model_path` |
-| `merge` | `output_dir` | `prune` | `model_path` |
-| `merge` | `output_dir` | `eval` | `model_path` |
-| `prune` | `output_dir` | `finetune` (healing) | `base_model` |
-| `finetune` | `output_dir/merged` (after merge_and_unload) | `quant` | `model_path` |
+| Host | Role | GPUs | GPU Framework | Notes |
+|------|------|------|---------------|-------|
+| `mad-lab-main` | coordinator + trainer | 2 (PCIe) | ROCm | 3900X 12c/24t, SN850 NVMe, 16GB RAM |
+| `mad-lab` | inference spoke | 2 (PCIe) | ROCm | training GPUs not powerful enough for multi-GPU overhead |
+| EC2 spot | training or inference spoke | varies | CUDA | launched on-demand via boto3 |
 
-If `imatrix: true` in a quant stage and no `dataset_prep` stage is present in the chain, the server returns a validation error at job creation time.
+The R9700 is connected via PCIe on the motherboard. The RX 6900 XT is in an eGPU enclosure connected via Thunderbolt 3 (~3-4 GB/s effective GPU-to-GPU bandwidth).
+
+Total local VRAM: 48 GB across both GPUs on mad-lab-main.
+System RAM on mad-lab-main: 16 GB (limits CPU offload ceiling for large model pruning).
+
+### 9.2 Training Framework by Stage Type
+
+#### Pretrain (From Scratch)
+
+- **Multi-GPU:** DeepSpeed ZeRO-2 with `overlap_comm: true` — overlaps gradient sync with backward pass to hide TB3 latency
+- **Single-GPU:** target either GPU explicitly (`gpu_target: r9700 | 6900xt | auto`)
+- **Single-GPU default:** recommended when model fits — avoids TB3 overhead entirely
+- **EC2:** CUDA, DeepSpeed or single-GPU depending on instance type
+
+#### Finetune (QLoRA)
+
+- **Always single-GPU** — QLoRA's 4-bit base + LoRA adapters fit on one card; DeepSpeed + bitsandbytes has known compatibility friction
+- `gpu_target: r9700 | 6900xt | auto` — enables parallel runs (e.g. healing finetune on 6900XT while something else runs on R9700)
+- `mode: healing` reuses the same executor with higher LR and fewer epochs — no separate executor needed
+- ROCm locally, CUDA on EC2
+
+### 9.3 Data Generation — Hub-and-Spoke
+
+Data generation always runs as a distributed hub-and-spoke job regardless of the run's `execution_target`.
+
+**Coordinator (always mad-lab-main):**
+- Python orchestration process runs on the 3900X — handles batching, fan-out, result collection, deduplication, quality scoring, and file writes
+- All output written to mad-lab-main SN850 NVMe (`~/.mad-lab-train/datagen/{run_id}/`)
+
+**Spokes (inference endpoints):**
+- Each spoke is a llama.cpp server with `--parallel N`
+- Coordinator distributes requests proportionally to each spoke's `parallel` capacity
+- Active spokes can be any combination of: mad-lab-main local GPUs, mad-lab GPUs, EC2 instance
+
+**Local spoke lifecycle (check-before-kill):**
+1. Check if llama.cpp is already running on the target host+port
+2. If running with matching model and args → leave it, register as spoke
+3. If running with different model/args → kill it, start fresh
+4. If not running → start it
+
+**EC2 spoke lifecycle:**
+1. Launch spot instance via boto3 (shared EC2 bootstrap module — see §9.5)
+2. Pull llama.cpp binary from S3 cache (avoid recompile on every launch)
+3. Pull model from HuggingFace using token from AWS SSM `/mad-lab/hf-token`
+4. Start llama.cpp server with configured `--parallel` and `--ctx-size`
+5. Wait for health check → register as spoke
+6. Terminate instance when data_gen stage completes
+
+**Parallelism targets:**
+- Local spoke (per GPU): 50–100 parallel slots depending on model size and VRAM
+- EC2 spoke: 250–500 parallel slots depending on instance type
+- Total across all spokes can exceed 500+ simultaneous requests — coordinator must respect per-spoke capacity
+
+### 9.4 Pruning Compute
+
+Pruning always operates on full-precision safetensors (FP16/BF16) downloaded from HuggingFace at job time. GGUFs cannot be pruned. The correct chain is always:
+
+```
+HF safetensors → prune → healing finetune → quant to GGUF
+```
+
+**Method selection:**
+- **Wanda (default):** processes one layer at a time, forward-pass only, minimal memory overhead. Uses `device_map="auto"` + explicit `max_memory` caps to spread across both local GPUs. Works well with models up to ~30B locally; beyond that, CPU offload to system RAM (16GB headroom is limited).
+- **LLM-Pruner (optional):** structural pruning — removes entire attention heads and MLP channels based on dependency graphs. Requires forward+backward pass per group (2-3x memory vs Wanda). Uses `--block_wise` mode in v1. A `WeightPager` abstraction slot is reserved for future integration with the NVMe→VRAM weight pager being built for MoE routing (architecturally identical primitive).
+
+**WeightPager interface (v1 stub, v2 implementation):**
+```python
+class WeightPager(Protocol):
+    def page_in(self, layer_ids: list[str]) -> None: ...
+    def page_out(self, layer_ids: list[str]) -> None: ...
+```
+
+LLM-Pruner executor accepts an optional `weight_pager: WeightPager | None`. When `None` (v1), falls back to `device_map` + CPU offload. When the MoE NVMe pager is built, it implements this protocol and can be injected with no changes to the pruning executor.
+
+### 9.5 Shared EC2 Bootstrap Module
+
+All stages that use EC2 (training, data_gen spoke, quant) share a single bootstrap module at `pipeline/ec2/bootstrap.py`. No stage duplicates EC2 launch/teardown logic.
+
+Responsibilities:
+- Launch spot instance via boto3 with run-specific config
+- Fetch HF token from AWS SSM Parameter Store (`/mad-lab/hf-token`, `--with-decryption`)
+- Pull stage-specific artifacts from S3 (llama.cpp binary, training scripts, etc.)
+- Execute remote setup script via SSH
+- Health-check the remote service
+- Register instance ID on the run record (`ec2_config.instance_id`)
+- Terminate on stage completion or failure
+
+**EC2 config fields (shared across all stages):**
+
+| Field | Description |
+|-------|-------------|
+| `instance_type` | e.g. `g6.4xlarge`, `g7e.2xlarge` |
+| `max_spot_price` | USD/hr ceiling |
+| `ami` | Base AMI ID |
+| `region` | AWS region |
+| `key_name` | EC2 key pair name |
+| `iam_profile` | Instance profile ARN |
+| `vpc_id` | VPC ID |
+| `storage_gb` | Root volume size |
+| `s3_artifacts` | List of S3 paths to pull on boot (stage-specific) |
 
 ---
 
-*Last updated: 2026-05-02 — MAD-69*
+## Auto-Wiring Rules
+
+When stages are chained, outputs are automatically wired to inputs at job creation time. Explicit values in the config override auto-wiring.
+
+| Producing Stage | Output | Consuming Stage | Auto-wired Field |
+|----------------|--------|-----------------|-----------------|
+| `dataset_prep` | `train.jsonl` | `data_gen` | `input_path` |
+| `dataset_prep` | `train.jsonl` | `finetune` | `dataset` |
+| `dataset_prep` | `eval.jsonl` | `finetune` | `eval_dataset` |
+| `dataset_prep` | `train.jsonl` | `quant` | `imatrix_dataset` |
+| `dataset_prep` | `train.jsonl` | `prune` | `calibration_dataset` |
+| `dataset_prep` | `eval.jsonl` | `eval` | benchmark dataset |
+| `data_gen` | `train.jsonl` | `finetune` | `dataset` *(if no dataset_prep)* |
+| `finetune` | adapter dir | `merge` | `adapter_path` |
+| `pretrain` | model dir | `quant` | `model_path` |
+| `merge` | merged model dir | `prune` | `model_path` |
+| `merge` | merged model dir | `eval` | `model_path` |
+| `prune` | pruned model dir | `finetune` (healing) | `base_model` |
+| `finetune` | merged weights | `quant` | `model_path` |
+
+**Validation at job creation:**
+- If `quant.imatrix: true` and no `dataset_prep` stage exists in the chain → 400 error
+- If `merge.eval_gate.enabled: true` and `eval_gate.threshold` is not set → 400 error
+- Stages must have a valid `sequence` order (no circular dependencies)
+
+---
+
+*Last updated: 2026-05-02 — MAD-69, compute architecture design session*
