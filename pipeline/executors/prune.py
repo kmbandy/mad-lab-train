@@ -136,7 +136,7 @@ def _prune_wanda(model, tokenizer, cal_texts, pruning_ratio, emit_sync) -> None:
     hooks = []
 
     def _make_hook(name):
-        def hook(module, inp, out):
+        def hook(_module, inp, _out):
             activation_cache.setdefault(name, []).append(inp[0].detach().float().cpu())
         return hook
 
@@ -209,9 +209,9 @@ def _prune_shortgpt(model, tokenizer, cal_texts, pruning_ratio, emit_sync) -> No
     hooks = []
 
     def _make_hooks(idx):
-        def pre_hook(module, inp):
+        def pre_hook(_module, inp):
             layer_inputs.setdefault(idx, []).append(inp[0].detach().float().cpu())
-        def post_hook(module, inp, out):
+        def post_hook(_module, inp, out):
             hidden = out[0] if isinstance(out, tuple) else out
             layer_outputs.setdefault(idx, []).append(hidden.detach().float().cpu())
         return pre_hook, post_hook
