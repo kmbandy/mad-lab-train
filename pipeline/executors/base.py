@@ -39,18 +39,24 @@ class BaseExecutor(ABC):
         ...
 
     async def emit_event(self, event_type: str, data: dict, stage_type: str | None = None) -> None:
-        """Write a structured event to the events table."""
+        """Write a structured event to the events table.
+
+        Uses its own short-lived session so SSE consumers see events immediately
+        without waiting for the orchestrator's long-lived transaction to commit.
+        """
         from datetime import datetime, timezone
 
+        from pipeline.db import AsyncSessionLocal
         from pipeline.models import Event, StageType
 
-        event = Event(
-            run_id=self.run_id,
-            stage_id=self.stage_id,
-            stage_type=StageType(stage_type) if stage_type else None,
-            event_type=event_type,
-            data=data,
-            ts=datetime.now(timezone.utc),
-        )
-        self.db.add(event)
-        await self.db.flush()
+        async with AsyncSessionLocal() as db:
+            event = Event(
+                run_id=self.run_id,
+                stage_id=self.stage_id,
+                stage_type=StageType(stage_type) if stage_type else None,
+                event_type=event_type,
+                data=data,
+                ts=datetime.now(timezone.utc),
+            )
+            db.add(event)
+            await db.commit()

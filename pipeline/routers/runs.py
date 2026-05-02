@@ -163,13 +163,22 @@ async def delete_run(run_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> N
 
 @router.post("/{run_id}/start")
 async def start_run(run_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
+    from pipeline.orchestrator import RunOrchestrator, get_orchestrator, register_orchestrator
+
     run = await _get_run_or_404(run_id, db)
     if run.status not in (JobStatus.pending, JobStatus.queued):
         raise HTTPException(status_code=409, detail="Run is not in a startable state")
+    if get_orchestrator(run_id):
+        raise HTTPException(status_code=409, detail="Run already has an active orchestrator")
+
     run.status = JobStatus.running
     run.started_at = datetime.now(timezone.utc)
     _add_event(run.id, "run_started", {}, db)
     await db.commit()
+
+    orch = RunOrchestrator(run_id)
+    register_orchestrator(run_id, orch)
+    orch.launch()
     return {"status": run.status}
 
 
@@ -187,33 +196,54 @@ async def cancel_run(run_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> d
 
 @router.post("/{run_id}/pause")
 async def pause_run(run_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
+    from pipeline.orchestrator import get_orchestrator
+
     run = await _get_run_or_404(run_id, db)
     if run.status != JobStatus.running:
         raise HTTPException(status_code=409, detail="Run is not running")
     _add_event(run.id, "pause_requested", {}, db)
     await db.commit()
+
+    orch = get_orchestrator(run_id)
+    if orch:
+        await orch.pause()
     return {"status": "pause_requested"}
 
 
 @router.post("/{run_id}/force-pause")
 async def force_pause_run(run_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
+    from pipeline.orchestrator import get_orchestrator
+
     run = await _get_run_or_404(run_id, db)
     if run.status != JobStatus.running:
         raise HTTPException(status_code=409, detail="Run is not running")
     _add_event(run.id, "force_pause_requested", {}, db)
     await db.commit()
+
+    orch = get_orchestrator(run_id)
+    if orch:
+        await orch.force_pause()
     return {"status": "force_pause_requested"}
 
 
 @router.post("/{run_id}/resume")
 async def resume_run(run_id: uuid.UUID, body: ResumeRequest, db: AsyncSession = Depends(get_db)) -> dict:
+    from pipeline.orchestrator import RunOrchestrator, get_orchestrator, register_orchestrator
+
     run = await _get_run_or_404(run_id, db)
     if run.status != JobStatus.paused:
         raise HTTPException(status_code=409, detail="Run is not paused")
+    if get_orchestrator(run_id):
+        raise HTTPException(status_code=409, detail="Run already has an active orchestrator")
+
     run.status = JobStatus.running
     checkpoint_id = str(body.checkpoint_id) if body.checkpoint_id else "latest_clean"
     _add_event(run.id, "run_resumed", {"checkpoint_id": checkpoint_id}, db)
     await db.commit()
+
+    orch = RunOrchestrator(run_id)
+    register_orchestrator(run_id, orch)
+    orch.launch()
     return {"status": run.status}
 
 
