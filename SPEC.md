@@ -2,7 +2,7 @@
 
 This document is the source of truth for the mad-lab-train v2 pipeline server and the Training Central Command dashboard tab. Both sides build against this spec. Do not begin implementation on either until this document is agreed upon.
 
-**Server:** mad-lab-train FastAPI pipeline server, port 18820  
+**Server:** mad-lab-train FastAPI pipeline server, port 18840 (18820 is mcp-atlassian)  
 **Client:** mad-lab-dash Training Central Command tab  
 **Database:** Local PostgreSQL (same instance the dashboard already uses)  
 **Migrations:** Alembic — all schema changes are versioned migration files  
@@ -317,7 +317,7 @@ These are tailed by the dashboard log panel. Cleaned up on the same schedule as 
 
 ## 4. REST API
 
-Base URL: `http://localhost:18820`
+Base URL: `http://localhost:18840`
 
 All responses are JSON. Errors return `{"error": "message"}` with appropriate HTTP status.
 

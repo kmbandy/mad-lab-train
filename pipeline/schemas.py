@@ -81,7 +81,7 @@ class CheckpointResponse(BaseModel):
     sequence: int
     is_clean: bool
     artifact_path: str
-    metadata: dict
+    meta: dict
     created_at: datetime
 
 

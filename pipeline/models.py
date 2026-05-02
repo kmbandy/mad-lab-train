@@ -6,8 +6,11 @@ from datetime import datetime, timezone
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
-from sqlalchemy import BigInteger, Boolean, ForeignKey, Index, Integer, Text, UniqueConstraint
-from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMPTZ, UUID
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Index, Integer, Text, UniqueConstraint
+from sqlalchemy.dialects.postgresql import JSONB, UUID
+
+# TIMESTAMPTZ equivalent in SQLAlchemy
+TIMESTAMPTZ = DateTime(timezone=True)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from pipeline.db import Base
@@ -133,7 +136,7 @@ class Checkpoint(Base):
     sequence: Mapped[int] = mapped_column(Integer, nullable=False)
     is_clean: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     artifact_path: Mapped[str] = mapped_column(Text, nullable=False)
-    metadata: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
+    meta: Mapped[dict] = mapped_column("metadata", JSONB, default=dict, nullable=False)
     created_at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, default=_now, nullable=False)
 
     run: Mapped["Run"] = relationship("Run", back_populates="checkpoints")
