@@ -40,6 +40,7 @@ class StageType(str, enum.Enum):
     data_gen = "data_gen"
     finetune = "finetune"
     pretrain = "pretrain"
+    moeify = "moeify"
     quant = "quant"
     merge = "merge"
     prune = "prune"

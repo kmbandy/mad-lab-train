@@ -159,6 +159,7 @@ def _make_executor(
     from pipeline.executors.eval import EvalExecutor
     from pipeline.executors.finetune import FinetuneExecutor
     from pipeline.executors.merge import MergeExecutor
+    from pipeline.executors.moeify import MoEifyExecutor
     from pipeline.executors.pretrain import PretrainExecutor
     from pipeline.executors.prune import PruneExecutor
     from pipeline.executors.quant import QuantExecutor
@@ -170,6 +171,7 @@ def _make_executor(
         "finetune": FinetuneExecutor,
         "pretrain": PretrainExecutor,
         "quant": QuantExecutor,
+        "moeify": MoEifyExecutor,
         "merge": MergeExecutor,
         "convert": ConvertExecutor,
         "upload": UploadExecutor,
