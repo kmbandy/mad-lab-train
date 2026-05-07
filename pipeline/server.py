@@ -2,7 +2,7 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from pipeline.routers import hardware, runs, sse, templates
+from pipeline.routers import datasets, hardware, runs, sse, templates
 from pipeline.settings import settings
 
 app = FastAPI(title="mad-lab-train pipeline server", version="2.0.0")
@@ -19,6 +19,7 @@ app.include_router(runs.router)
 app.include_router(sse.router)
 app.include_router(templates.router)
 app.include_router(hardware.router)
+app.include_router(datasets.router)
 
 
 def main() -> None:

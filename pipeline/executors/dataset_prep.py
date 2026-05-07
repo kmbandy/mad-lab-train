@@ -4,11 +4,38 @@ import json
 import os
 import random
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from pipeline.executors.base import BaseExecutor
+
+_DATASETS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS records (
+    id           VARCHAR DEFAULT gen_random_uuid(),
+    run_id       VARCHAR NOT NULL,
+    run_name     VARCHAR,
+    source_type  VARCHAR,
+    source_name  VARCHAR,
+    purpose      VARCHAR DEFAULT 'training',
+    content_hash VARCHAR(16),
+    messages     JSON,
+    token_count  INTEGER,
+    created_at   TIMESTAMP DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_records_run_id ON records (run_id);
+CREATE INDEX IF NOT EXISTS idx_records_purpose ON records (purpose);
+CREATE INDEX IF NOT EXISTS idx_records_hash ON records (content_hash);
+"""
+
+
+def _open_datasets_db(base_dir: Path):
+    import duckdb
+    db_path = base_dir / "datasets.db"
+    con = duckdb.connect(str(db_path))
+    con.execute(_DATASETS_SCHEMA)
+    return con
 
 
 class DatasetPrepExecutor(BaseExecutor):
@@ -18,14 +45,27 @@ class DatasetPrepExecutor(BaseExecutor):
         self._force_pause = False
 
     async def run(self) -> str | None:
+        from pipeline.models import Run
         from pipeline.settings import settings
+        from sqlalchemy import select
 
-        out_dir = Path(os.path.expanduser(settings.log_dir)).parent / "datasets" / str(self.run_id)
+        base_dir = Path(os.path.expanduser(settings.log_dir)).parent
+        out_dir = base_dir / "datasets" / str(self.run_id)
         out_dir.mkdir(parents=True, exist_ok=True)
 
         sources = self.config.get("sources", [])
         train_split = float(self.config.get("train_split", 0.9))
         deduplicate = bool(self.config.get("deduplicate", True))
+
+        # Fetch run name for DuckDB annotation
+        run_name: str | None = None
+        try:
+            result = await self.db.execute(select(Run).where(Run.id == self.run_id))
+            run_obj = result.scalar_one_or_none()
+            if run_obj:
+                run_name = run_obj.name
+        except Exception:
+            pass
 
         # Load checkpoint to resume from
         checkpoint = self._load_checkpoint(out_dir)
@@ -39,6 +79,9 @@ class DatasetPrepExecutor(BaseExecutor):
         training_f = open(training_path, "a")
         context_f = open(context_path, "a")
         calibration_f = open(calibration_path, "a")
+
+        ddb = _open_datasets_db(base_dir)
+        now = datetime.now(timezone.utc)
 
         try:
             for i, source_cfg in enumerate(sources):
@@ -62,13 +105,22 @@ class DatasetPrepExecutor(BaseExecutor):
                     if self._force_pause or self._pause_requested:
                         break
 
+                    h = _content_hash(record)
                     if deduplicate:
-                        h = _content_hash(record)
                         if h in seen_hashes:
                             continue
                         seen_hashes.add(h)
 
                     out_file.write(json.dumps(record) + "\n")
+
+                    token_count = _estimate_tokens(record)
+                    ddb.execute(
+                        "INSERT INTO records (run_id, run_name, source_type, source_name, purpose, "
+                        "content_hash, messages, token_count, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                        [str(self.run_id), run_name, source_cfg["type"], source_name, purpose,
+                         h, json.dumps(record["messages"]), token_count, now],
+                    )
+
                     count += 1
 
                     if count % 100 == 0:
@@ -92,12 +144,17 @@ class DatasetPrepExecutor(BaseExecutor):
             training_f.close()
             context_f.close()
             calibration_f.close()
+            ddb.close()
 
         if self._force_pause or self._pause_requested:
             return None
 
         # Split training.jsonl into train/eval
         _split_train_eval(training_path, out_dir / "train.jsonl", out_dir / "eval.jsonl", train_split)
+
+        # Fire-and-forget MotherDuck sync if token is available
+        if os.getenv("MOTHERDUCK_TOKEN"):
+            asyncio.create_task(_sync_motherduck_bg(base_dir))
 
         return str(out_dir)
 
@@ -336,6 +393,19 @@ def _wrap_text(text: str) -> dict:
 def _content_hash(record: dict) -> str:
     content = " ".join(m.get("content", "") for m in record.get("messages", []))
     return hashlib.sha256(content.encode()).hexdigest()[:16]
+
+
+def _estimate_tokens(record: dict) -> int:
+    content = " ".join(m.get("content", "") for m in record.get("messages", []))
+    return max(1, len(content) // 4)
+
+
+async def _sync_motherduck_bg(base_dir: Path) -> None:
+    from pipeline.routers.datasets import _do_sync
+    try:
+        await asyncio.to_thread(_do_sync)
+    except Exception:
+        pass  # sync failure never surfaces to the pipeline run
 
 
 def _split_train_eval(source: Path, train_out: Path, eval_out: Path, train_ratio: float) -> None:
