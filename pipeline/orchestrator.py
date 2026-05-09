@@ -56,10 +56,14 @@ class RunOrchestrator:
 
     async def _execute(self) -> None:
         from pipeline.db import AsyncSessionLocal
-        from pipeline.models import JobStatus, Stage, StageConfig, StageStatus
+        from pipeline.models import ExecutionTarget, JobStatus, Run, Stage, StageConfig, StageStatus
 
         async with AsyncSessionLocal() as db:
             try:
+                run = await db.get(Run, self.run_id)
+                ec2_config: dict = run.ec2_config or {} if run else {}
+                use_ec2 = run and run.execution_target == ExecutionTarget.ec2
+
                 result = await db.execute(
                     select(Stage)
                     .where(Stage.run_id == self.run_id)
@@ -78,9 +82,15 @@ class RunOrchestrator:
                     await db.commit()
 
                     cfg_data = stage.config.config if stage.config else {}
-                    executor = _make_executor(
-                        stage.stage_type.value, self.run_id, stage.id, cfg_data, db
-                    )
+
+                    if use_ec2:
+                        from pipeline.executors.ec2 import Ec2Executor
+                        merged = {**ec2_config, **cfg_data, "stage_type": stage.stage_type.value}
+                        executor = Ec2Executor(self.run_id, stage.id, merged, db)
+                    else:
+                        executor = _make_executor(
+                            stage.stage_type.value, self.run_id, stage.id, cfg_data, db
+                        )
                     self._current_executor = executor
 
                     output_path: str | None = None
