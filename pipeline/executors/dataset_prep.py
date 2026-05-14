@@ -183,6 +183,9 @@ class DatasetPrepExecutor(BaseExecutor):
         elif source_type == "raw":
             async for r in _iter_raw(cfg, max_records):
                 yield r
+        elif source_type == "claude_jsonl":
+            async for r in _iter_claude_jsonl(cfg, max_records):
+                yield r
 
     def _load_checkpoint(self, out_dir: Path) -> dict:
         cp = out_dir / ".checkpoint.json"
@@ -201,7 +204,7 @@ class DatasetPrepExecutor(BaseExecutor):
         }))
 
 
-# ── Source iterators ──────────────────────────────────────────────────────────
+# ── Source iterators ─────────────────────────────────────────────
 
 async def _iter_huggingface(cfg: dict, max_records: int | None):
     from datasets import load_dataset
@@ -339,7 +342,266 @@ async def _iter_raw(cfg: dict, max_records: int | None):
                 await asyncio.sleep(0)
 
 
-# ── Normalization helpers ─────────────────────────────────────────────────────
+async def _iter_claude_jsonl(cfg: dict, max_records: int | None):
+    """Iterate Claude Code JSONL session transcripts (MAD-164).
+
+    Each transcript file is one session. Emits MAD-162-shaped records — one
+    per turn (default) or one per session — with `messages` for pipeline
+    compatibility and a `trace` sidecar carrying memory_calls, session metadata,
+    and provenance for downstream span annotation and memory-conditioned
+    routing training (MAD-161).
+    """
+    path = Path(os.path.expanduser(cfg["path"]))
+    recursive = bool(cfg.get("recursive", True))
+    unit = cfg.get("unit", "turn")
+    min_turn_chars = int(cfg.get("min_turn_chars", 0))
+    agent = cfg.get("agent", "claude-code")
+    trace_source = cfg.get("trace_source", "organic_work")
+
+    if path.is_file():
+        files = [path]
+    elif path.is_dir():
+        pattern = "**/*.jsonl" if recursive else "*.jsonl"
+        files = sorted(path.glob(pattern))
+    else:
+        return
+
+    count = 0
+    for file_path in files:
+        if max_records and count >= max_records:
+            break
+        try:
+            async for record in _parse_claude_session(
+                file_path, unit, min_turn_chars, agent, trace_source
+            ):
+                if max_records and count >= max_records:
+                    break
+                yield record
+                count += 1
+                if count % 50 == 0:
+                    await asyncio.sleep(0)
+        except Exception:
+            # Skip malformed files; never crash the whole run on one bad transcript
+            continue
+
+
+async def _parse_claude_session(
+    file_path: Path,
+    unit: str,
+    min_turn_chars: int,
+    agent: str,
+    trace_source: str,
+):
+    """Parse one Claude Code JSONL session into MAD-162 turn records.
+
+    A turn starts at a user message with string content (real user prompt)
+    and continues until the next such message or EOF. Tool-result wrappers
+    (user messages with list content) belong to the turn that issued the
+    tool_use.
+    """
+    messages: list[dict] = []
+    session_meta: dict = {}
+
+    with open(file_path) as f:
+        for line in f:
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            if obj.get("type") not in ("user", "assistant"):
+                continue
+            if not session_meta:
+                session_meta = {
+                    "session_id": obj.get("sessionId", ""),
+                    "cwd": obj.get("cwd", ""),
+                    "git_branch": obj.get("gitBranch", ""),
+                }
+            messages.append(obj)
+
+    if not messages:
+        return
+
+    turns: list[dict] = []
+    current: dict | None = None
+
+    for obj in messages:
+        t = obj["type"]
+        msg = obj.get("message", {})
+        content = msg.get("content", "")
+        timestamp = obj.get("timestamp", "")
+
+        if t == "user":
+            if isinstance(content, str):
+                if current is not None:
+                    turns.append(current)
+                current = {
+                    "user_text": content,
+                    "assistant_text_parts": [],
+                    "tool_uses": [],
+                    "tool_results": {},
+                    "started_at": timestamp,
+                    "model": None,
+                }
+            elif isinstance(content, list):
+                if current is None:
+                    continue
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") == "tool_result":
+                        tuid = block.get("tool_use_id", "")
+                        current["tool_results"][tuid] = {
+                            "content": block.get("content", ""),
+                            "is_error": block.get("is_error", False),
+                        }
+
+        elif t == "assistant":
+            if current is None:
+                continue
+            if not current["model"]:
+                current["model"] = msg.get("model", "")
+            if isinstance(content, list):
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    btype = block.get("type")
+                    if btype == "text":
+                        current["assistant_text_parts"].append(block.get("text", ""))
+                    elif btype == "tool_use":
+                        current["tool_uses"].append({
+                            "id": block.get("id", ""),
+                            "name": block.get("name", ""),
+                            "input": block.get("input", {}),
+                            "timestamp": timestamp,
+                        })
+            elif isinstance(content, str):
+                current["assistant_text_parts"].append(content)
+
+    if current is not None:
+        turns.append(current)
+
+    if unit == "session":
+        if not turns:
+            return
+        all_user = "\n\n".join(t["user_text"] for t in turns)
+        all_asst = "\n\n".join("".join(t["assistant_text_parts"]).strip() for t in turns)
+        if len(all_user) + len(all_asst) < min_turn_chars:
+            return
+        all_calls: list[dict] = []
+        for t in turns:
+            all_calls.extend(_build_memory_calls(t))
+        yield _build_trace_record(
+            all_user, all_asst, all_calls, session_meta, agent, trace_source,
+            turns[0]["started_at"], turns[0]["model"] or "",
+        )
+        return
+
+    for turn in turns:
+        asst_text = "".join(turn["assistant_text_parts"]).strip()
+        if not asst_text and not turn["tool_uses"]:
+            continue
+        if len(turn["user_text"]) + len(asst_text) < min_turn_chars:
+            continue
+        yield _build_trace_record(
+            turn["user_text"], asst_text, _build_memory_calls(turn),
+            session_meta, agent, trace_source,
+            turn["started_at"], turn["model"] or "",
+        )
+
+
+def _build_memory_calls(turn: dict) -> list[dict]:
+    """Pair tool_use entries with their matching tool_result entries."""
+    calls = []
+    for use in turn["tool_uses"]:
+        result = turn["tool_results"].get(use["id"])
+        if result is not None:
+            success = not result.get("is_error", False)
+            results_content = result.get("content")
+            result_count = _count_tool_results(results_content)
+        else:
+            success = None
+            results_content = None
+            result_count = 0
+        calls.append({
+            "tool_name": use["name"],
+            "operation_type": _classify_tool_op(use["name"]),
+            "query": use["input"],
+            "results": results_content,
+            "result_count": result_count,
+            "success": success,
+            "latency_ms": None,
+            "timestamp": use["timestamp"],
+        })
+    return calls
+
+
+_OP_HINTS = (
+    ("search", "search"), ("find", "search"), ("query", "search"),
+    ("read", "search"), ("get", "search"), ("list", "search"),
+    ("fetch", "search"), ("grep", "search"),
+    ("write", "write"), ("create", "write"), ("add", "write"), ("insert", "write"),
+    ("update", "update"), ("edit", "update"), ("modify", "update"),
+    ("delete", "delete"), ("remove", "delete"),
+)
+
+
+def _classify_tool_op(tool_name: str) -> str:
+    """Map a tool name to an MAD-162 operation_type (best-effort by keyword)."""
+    if not tool_name:
+        return "other"
+    n = tool_name.lower()
+    for hint, op in _OP_HINTS:
+        if hint in n:
+            return op
+    return "other"
+
+
+def _count_tool_results(content) -> int:
+    if content is None:
+        return 0
+    if isinstance(content, list):
+        return len(content)
+    if isinstance(content, str):
+        return 1 if content.strip() else 0
+    return 1
+
+
+def _build_trace_record(
+    user_text: str,
+    asst_text: str,
+    memory_calls: list[dict],
+    session_meta: dict,
+    agent: str,
+    trace_source: str,
+    started_at: str,
+    model: str,
+) -> dict:
+    """Build a MAD-162-shaped record. `messages` keeps pipeline compat;
+    `trace` carries retrieval / provenance / span-annotation slots."""
+    return {
+        "messages": [
+            {"role": "user", "content": user_text},
+            {"role": "assistant", "content": asst_text},
+        ],
+        "trace": {
+            "session_id": session_meta.get("session_id", ""),
+            "agent": agent,
+            "model": model,
+            "timestamp": started_at,
+            "cwd": session_meta.get("cwd", ""),
+            "git_branch": session_meta.get("git_branch", ""),
+            "trace_source": trace_source,
+            "domain_tag": None,
+            "memory_calls": memory_calls,
+            "retrieved_spans": [],
+            "reasoning_spans": [],
+            "generation_spans": [],
+            "task_outcome": None,
+        },
+    }
+
+
+# ── Normalization helpers ─────────────────────────────────────────
 
 def _normalize_row(row: dict, fmt: str, schema: dict) -> dict | None:
     system = schema.get("system_prompt") or (row.get(schema.get("system_col", "")) if schema.get("system_col") else None)
