@@ -173,12 +173,18 @@ class DataGenExecutor(BaseExecutor):
         return workers
 
     async def _run_trace_farm(self, cfg: dict, out_dir: Path) -> str | None:
-        """Trace farming mode (MAD-163, sub-stages 163.1 + 163.2).
+        """Trace farming mode (MAD-163).
 
-        Stage 1 only: seed sampler + question-gen pre-step. No agent loop yet
-        (that's 163.3). Emits "question records" with trace_source=
-        programmatic_task_question_seed so we can sanity-check the seed-to-
-        question pipeline before wiring tool dispatch.
+        163.1+.2 path: question-only emission when no `agents` config is set.
+            Emits records with trace_source=programmatic_task_question_seed.
+        163.3 path: full agent dispatch via openai-agents-python + Mneme.
+            Each question is sent to a real KG-agent (LiteLLM → llama-server,
+            mad-lab-memory MCP tools, per-agent_id Mneme KG namespace), and
+            the full multi-turn trace is captured as MAD-162 shape with
+            trace_source=programmatic_task.
+
+        The two paths share seed sampling + question generation; only the
+        post-question dispatch differs. Agent loop is opt-in via cfg["agents"].
         """
         seed_source = cfg.get("seed_source") or {}
         question_gen = cfg.get("question_gen") or {}
@@ -189,12 +195,17 @@ class DataGenExecutor(BaseExecutor):
         ctx_size = int(cfg.get("ctx_size", 4096))
         question_gen_model = question_gen.get("model", cfg.get("model", ""))
 
-        output_path = out_dir / "trace_farm_questions.jsonl"
+        agents_cfg = cfg.get("agents") or []
+        agent_instructions = cfg.get("agent_instructions") or _DEFAULT_AGENT_INSTRUCTIONS
+        agent_loop_enabled = bool(agents_cfg)
+        sub_stage = "agent_loop_163.3" if agent_loop_enabled else "questions_only_163.1_163.2"
 
-        # Resume support — checkpoint key uses a distinct name so it doesn't
-        # collide with the `generate` mode checkpoint format.
+        output_filename = "trace_farm_traces.jsonl" if agent_loop_enabled else "trace_farm_questions.jsonl"
+        output_path = out_dir / output_filename
+
         checkpoint = _load_checkpoint(out_dir)
-        samples_done = int(checkpoint.get("trace_farm_samples_done", 0))
+        ckpt_key = "trace_farm_traces_done" if agent_loop_enabled else "trace_farm_samples_done"
+        samples_done = int(checkpoint.get(ckpt_key, 0))
 
         # Question-gen worker pool — usually a tiny pool (1-2 slots on R9700)
         qg_worker_cfgs = [question_gen.get("worker")] if question_gen.get("worker") else []
@@ -204,47 +215,99 @@ class DataGenExecutor(BaseExecutor):
         if not qg_pool.workers:
             raise RuntimeError("trace_farm: no healthy question-gen workers")
 
+        # Agent pool (163.3) — one openai-agents-python Agent per parallel slot
+        # across all configured agent servers. Each slot gets a stable agent_id
+        # (= Mneme KG namespace). Slots are dispatched round-robin in 163.3;
+        # 163.4 adds least-KG-coverage routing.
+        agent_pool: list[tuple[str, object, str]] = []
+        if agent_loop_enabled:
+            agent_pool = await _build_mneme_agent_pool(agents_cfg, agent_instructions)
+            if not agent_pool:
+                raise RuntimeError("trace_farm: agents configured but no slots came up")
+
         await self.emit_event("stage_started", {
             "stage_type": "data_gen",
             "mode": "trace_farm",
-            "sub_stage": "questions_only_163.1_163.2",
+            "sub_stage": sub_stage,
             "qg_workers": len(qg_pool.workers),
             "qg_capacity": qg_pool.total_capacity,
+            "agent_slots": len(agent_pool),
             "seed_source_type": seed_source.get("type", "qdrant"),
             "pattern_mix": pattern_mix,
         }, stage_type="data_gen")
 
-        # Seed iterator — yields seed-source points lazily so we don't pull
-        # 100K records into memory at once.
         seed_iter = _iter_seed_source(seed_source)
+        dispatch_state = {"round_robin": 0}
+
+        async def _generate_question(seed) -> tuple[str, str] | None:
+            """Returns (question, pattern) or None on failure."""
+            pattern = _pick_pattern(pattern_mix)
+            prompt = _render_question_prompt(seed, pattern)
+            messages = [
+                {"role": "system", "content": _QUESTION_GEN_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ]
+            worker = qg_pool.pick()
+            if not worker:
+                return None
+            response = await worker.generate(messages, temperature, max_tokens)
+            if not response or not response.strip():
+                return None
+            return response.strip(), pattern
 
         try:
             with open(output_path, "a") as out_f:
-                semaphore = asyncio.Semaphore(qg_pool.total_capacity)
+                # Capacity for the concurrent fan-out is bounded by whichever
+                # tier is smaller: question-gen capacity or agent-pool size.
+                fan_out_capacity = (
+                    min(qg_pool.total_capacity, len(agent_pool)) if agent_loop_enabled
+                    else qg_pool.total_capacity
+                )
+                semaphore = asyncio.Semaphore(fan_out_capacity)
 
                 async def farm_one(slot_idx: int) -> dict | None:
                     seed = next(seed_iter, None)
                     if seed is None:
                         return None
-                    pattern = _pick_pattern(pattern_mix)
-                    prompt = _render_question_prompt(seed, pattern)
-                    messages = [
-                        {"role": "system", "content": _QUESTION_GEN_SYSTEM_PROMPT},
-                        {"role": "user", "content": prompt},
-                    ]
-                    worker = qg_pool.pick()
-                    if not worker:
+                    qg_result = await _generate_question(seed)
+                    if qg_result is None:
                         return None
-                    response = await worker.generate(messages, temperature, max_tokens)
-                    if not response or not response.strip():
-                        return None
-                    return _build_question_record(
-                        question=response.strip(),
+                    question, pattern = qg_result
+
+                    if not agent_loop_enabled:
+                        return _build_question_record(
+                            question=question,
+                            seed=seed,
+                            seed_source_cfg=seed_source,
+                            pattern=pattern,
+                            task_generator="qdrant_seed_questiongen",
+                            model_used=question_gen_model,
+                        )
+
+                    agent_id, agent, agent_model = _pick_agent_slot(agent_pool, dispatch_state)
+                    try:
+                        result = await _run_mneme_agent(agent, question, agent_id)
+                    except Exception as exc:
+                        # Failed-trace records are valuable too — they're the
+                        # "agent crashed during a hard task" data point. Still
+                        # capture with task_outcome=failed.
+                        return _build_trace_record_from_failure(
+                            question=question,
+                            seed=seed,
+                            pattern=pattern,
+                            agent_id=agent_id,
+                            agent_model=agent_model,
+                            error=str(exc),
+                            task_generator="qdrant_seed_questiongen",
+                        )
+                    return _build_trace_record_from_agent_result(
+                        question=question,
                         seed=seed,
-                        seed_source_cfg=seed_source,
                         pattern=pattern,
+                        agent_id=agent_id,
+                        agent_model=agent_model,
+                        result=result,
                         task_generator="qdrant_seed_questiongen",
-                        model_used=question_gen_model,
                     )
 
                 async def run_slot(slot_idx: int) -> None:
@@ -262,10 +325,12 @@ class DataGenExecutor(BaseExecutor):
                             "count": samples_done,
                             "total": samples_target,
                             "mode": "trace_farm",
+                            "sub_stage": sub_stage,
                             "pattern": record["trace"].get("pattern"),
+                            "task_outcome": record["trace"].get("task_outcome"),
                         }, stage_type="data_gen")
                         if samples_done % 100 == 0:
-                            _save_checkpoint(out_dir, samples_done, key="trace_farm_samples_done")
+                            _save_checkpoint(out_dir, samples_done, key=ckpt_key)
 
                 remaining = samples_target - samples_done
                 tasks = [asyncio.create_task(run_slot(i)) for i in range(remaining)]
@@ -571,6 +636,317 @@ def _build_question_record(
             "reasoning_spans": [],
             "generation_spans": [],
             "task_outcome": None,
+        },
+    }
+
+
+# ── 163.3 Mneme KG-agent dispatch ─────────────────────────────────────────────
+
+_DEFAULT_AGENT_INSTRUCTIONS = (
+    "You are an AI agent with access to long-term semantic memory through "
+    "the memory_search, memory_write, and memory_graph tools. Answer the "
+    "user's question using these tools as needed. Search memory before "
+    "answering when the question relates to prior context. Write a "
+    "session_summary or relevant facts back to memory if you produce new "
+    "information worth remembering. Be concise but thorough."
+)
+
+
+async def _build_mneme_agent_pool(
+    agents_cfg: list[dict],
+    instructions: str,
+) -> list[tuple[str, object, str]]:
+    """Build the per-slot Mneme agent pool.
+
+    Returns list of (agent_id, Agent, model_label) tuples. Each parallel slot
+    on each configured agent server gets its own stable agent_id (= Mneme KG
+    namespace) and its own Agent instance. The Agent's LLM is LiteLLM pointing
+    at the slot's llama-server endpoint; tools come from build_memory_tools
+    scoped to the agent_id."""
+    # Lazy imports — keep the module importable even when openai-agents-python
+    # isn't installed (the question-only 163.1+.2 path doesn't need it).
+    from agents import Agent
+    from agents.extensions.models.litellm_model import LitellmModel
+    from agents.memory.mneme.tools import build_memory_tools
+
+    pool: list[tuple[str, object, str]] = []
+    for srv_cfg in agents_cfg:
+        host = srv_cfg["host"]
+        port = int(srv_cfg["port"])
+        parallel = int(srv_cfg.get("parallel", 1))
+        prefix = srv_cfg.get("agent_id_prefix", "agent")
+        model_name = srv_cfg.get("model") or "local"
+        api_base = srv_cfg.get("api_base") or f"http://{host}:{port}/v1"
+        api_key = srv_cfg.get("api_key", "sk-no-key-required")
+        litellm_model = LitellmModel(
+            model=f"openai/{model_name}",
+            api_base=api_base,
+            api_key=api_key,
+        )
+        for i in range(parallel):
+            agent_id = f"{prefix}-{i:02d}"
+            agent = Agent(
+                name=f"trace-farm-{agent_id}",
+                instructions=instructions,
+                model=litellm_model,
+                tools=build_memory_tools(agent_id=agent_id),
+            )
+            pool.append((agent_id, agent, model_name))
+    return pool
+
+
+def _pick_agent_slot(
+    pool: list[tuple[str, object, str]],
+    dispatch_state: dict,
+) -> tuple[str, object, str]:
+    """163.3 dispatch policy: simple round-robin. 163.4 swaps in least-KG-
+    coverage routing once we have per-agent KG-stats telemetry."""
+    idx = dispatch_state["round_robin"] % len(pool)
+    dispatch_state["round_robin"] = (dispatch_state["round_robin"] + 1) % (len(pool) * 1_000_000)
+    return pool[idx]
+
+
+async def _run_mneme_agent(agent: object, message: str, agent_id: str):
+    """Wrapper around openai-agents-python's run_with_memory.
+
+    Centralized so test/mock paths can patch this single function. Also
+    applies a safety timeout so a stuck agent doesn't block the whole farm."""
+    from agents.memory.mneme.runner import run_with_memory
+    return await asyncio.wait_for(
+        run_with_memory(
+            agent=agent,
+            message=message,
+            agent_id=agent_id,
+            top_k=6,
+            score_threshold=0.4,
+            auto_summarize=True,
+        ),
+        timeout=300.0,  # 5 minutes per trace; tunable later
+    )
+
+
+_MNEME_OP_HINTS = (
+    ("search", "search"), ("query", "search"), ("graph", "search"),
+    ("write", "write"), ("add", "write"), ("update", "update"),
+    ("delete", "delete"),
+)
+
+
+def _classify_mneme_tool_op(tool_name: str) -> str:
+    """Map a Mneme tool name (memory_search / memory_write / memory_graph /
+    custom additions) to an MAD-162 operation_type."""
+    if not tool_name:
+        return "other"
+    n = tool_name.lower()
+    for hint, op in _MNEME_OP_HINTS:
+        if hint in n:
+            return op
+    return "other"
+
+
+def _count_mneme_results(output) -> int:
+    if output is None:
+        return 0
+    if isinstance(output, list):
+        return len(output)
+    if isinstance(output, str):
+        return 1 if output.strip() else 0
+    return 1
+
+
+def _build_trace_record_from_agent_result(
+    question: str,
+    seed: "_SeedPoint",
+    pattern: str,
+    agent_id: str,
+    agent_model: str,
+    result: object,
+    task_generator: str,
+) -> dict:
+    """Convert openai-agents-python RunResult → MAD-162 trace record.
+
+    Walks `result.new_items`:
+      - ToolCallItem      → starts a memory_call (tool_name + query args)
+      - ToolCallOutputItem → completes the matching memory_call (results + success)
+      - MessageOutputItem → contributes to the final assistant text
+
+    Tool-call/output pairing is by call_id when available; falls back to
+    position-order pairing if call_ids aren't present.
+    """
+    timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+    memory_calls: list[dict] = []
+    pending_by_id: dict[str, dict] = {}
+    pending_order: list[dict] = []
+    assistant_parts: list[str] = []
+
+    # Lazy import so question-only farms don't need openai-agents-python.
+    try:
+        from agents.items import (
+            ToolCallItem,
+            ToolCallOutputItem,
+            MessageOutputItem,
+        )
+    except Exception:
+        ToolCallItem = ToolCallOutputItem = MessageOutputItem = None  # type: ignore
+
+    new_items = getattr(result, "new_items", []) or []
+    for item in new_items:
+        if ToolCallItem is not None and isinstance(item, ToolCallItem):
+            raw = getattr(item, "raw_item", None)
+            tool_name = getattr(raw, "name", "") or (
+                raw.get("name", "") if isinstance(raw, dict) else ""
+            )
+            call_id = (
+                getattr(raw, "call_id", None)
+                or getattr(raw, "id", None)
+                or (raw.get("call_id") if isinstance(raw, dict) else None)
+                or (raw.get("id") if isinstance(raw, dict) else None)
+                or ""
+            )
+            arguments = getattr(raw, "arguments", None)
+            if arguments is None and isinstance(raw, dict):
+                arguments = raw.get("arguments")
+            query: object
+            if isinstance(arguments, str):
+                try:
+                    query = json.loads(arguments)
+                except Exception:
+                    query = {"raw": arguments}
+            else:
+                query = arguments or {}
+            entry = {
+                "tool_name": tool_name,
+                "operation_type": _classify_mneme_tool_op(tool_name),
+                "query": query,
+                "results": None,
+                "result_count": 0,
+                "success": None,
+                "latency_ms": None,
+                "timestamp": timestamp,
+            }
+            if call_id:
+                pending_by_id[call_id] = entry
+            else:
+                pending_order.append(entry)
+            memory_calls.append(entry)
+
+        elif ToolCallOutputItem is not None and isinstance(item, ToolCallOutputItem):
+            raw = getattr(item, "raw_item", None)
+            call_id = (
+                getattr(raw, "call_id", None)
+                or (raw.get("call_id") if isinstance(raw, dict) else None)
+                or ""
+            )
+            output = getattr(raw, "output", None)
+            if output is None and isinstance(raw, dict):
+                output = raw.get("output")
+            target = None
+            if call_id and call_id in pending_by_id:
+                target = pending_by_id.pop(call_id)
+            elif pending_order:
+                target = pending_order.pop(0)
+            if target is not None:
+                is_err = False
+                if isinstance(output, dict):
+                    is_err = bool(output.get("is_error") or output.get("error"))
+                target["results"] = output
+                target["result_count"] = _count_mneme_results(output)
+                target["success"] = not is_err
+
+        elif MessageOutputItem is not None and isinstance(item, MessageOutputItem):
+            raw = getattr(item, "raw_item", None)
+            # ResponseOutputMessage has a .content list of content parts; each
+            # part with type=output_text has a .text attribute.
+            content = getattr(raw, "content", None)
+            if content is None and isinstance(raw, dict):
+                content = raw.get("content")
+            if isinstance(content, list):
+                for part in content:
+                    text = (
+                        getattr(part, "text", None)
+                        or (part.get("text") if isinstance(part, dict) else None)
+                    )
+                    if isinstance(text, str) and text.strip():
+                        assistant_parts.append(text.strip())
+            elif isinstance(content, str) and content.strip():
+                assistant_parts.append(content.strip())
+
+    assistant_text = "\n".join(assistant_parts).strip()
+    final_output = getattr(result, "final_output", None)
+    if not assistant_text and isinstance(final_output, str) and final_output.strip():
+        assistant_text = final_output.strip()
+
+    task_outcome = "success" if assistant_text else "abandoned"
+
+    return {
+        "messages": [
+            {"role": "user", "content": question},
+            {"role": "assistant", "content": assistant_text},
+        ],
+        "trace": {
+            "session_id": "",
+            "agent": agent_id,
+            "model": agent_model,
+            "timestamp": timestamp,
+            "cwd": "",
+            "git_branch": "",
+            "trace_source": "programmatic_task",
+            "domain_tag": seed.domain,
+            "task_generator": task_generator,
+            "pattern": pattern,
+            "seed_id": seed.id,
+            "seed_source_type": seed.source_type,
+            "seed_source_name": seed.source_name,
+            "seed_content_preview": seed.content[:500],
+            "memory_calls": memory_calls,
+            "retrieved_spans": [],
+            "reasoning_spans": [],
+            "generation_spans": [],
+            "task_outcome": task_outcome,
+        },
+    }
+
+
+def _build_trace_record_from_failure(
+    question: str,
+    seed: "_SeedPoint",
+    pattern: str,
+    agent_id: str,
+    agent_model: str,
+    error: str,
+    task_generator: str,
+) -> dict:
+    """Capture a failed dispatch as a trace record with task_outcome=failed.
+
+    These are valuable: they're the "agent crashed during a hard task" data
+    point that the model needs to see in training, not silent drop."""
+    timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+    return {
+        "messages": [
+            {"role": "user", "content": question},
+            {"role": "assistant", "content": ""},
+        ],
+        "trace": {
+            "session_id": "",
+            "agent": agent_id,
+            "model": agent_model,
+            "timestamp": timestamp,
+            "cwd": "",
+            "git_branch": "",
+            "trace_source": "programmatic_task",
+            "domain_tag": seed.domain,
+            "task_generator": task_generator,
+            "pattern": pattern,
+            "seed_id": seed.id,
+            "seed_source_type": seed.source_type,
+            "seed_source_name": seed.source_name,
+            "seed_content_preview": seed.content[:500],
+            "memory_calls": [],
+            "retrieved_spans": [],
+            "reasoning_spans": [],
+            "generation_spans": [],
+            "task_outcome": "failed",
+            "error": error[:500],
         },
     }
 
