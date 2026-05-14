@@ -350,13 +350,28 @@ async def _iter_claude_jsonl(cfg: dict, max_records: int | None):
     compatibility and a `trace` sidecar carrying memory_calls, session metadata,
     and provenance for downstream span annotation and memory-conditioned
     routing training (MAD-161).
+
+    If `reconstruct_injections: true`, each turn is additionally enriched by
+    replaying the personal-KG `/context` endpoint against the user prompt
+    (mirroring the runtime hook logic) and attaching the result as a synthetic
+    `personal-kg-context-replay` memory_call. This recovers the memory-
+    conditioning signal that runtime hooks would have injected at session
+    time but that was never persisted to disk.
     """
     path = Path(os.path.expanduser(cfg["path"]))
     recursive = bool(cfg.get("recursive", True))
     unit = cfg.get("unit", "turn")
     min_turn_chars = int(cfg.get("min_turn_chars", 0))
     agent = cfg.get("agent", "claude-code")
-    trace_source = cfg.get("trace_source", "organic_work")
+    base_trace_source = cfg.get("trace_source", "organic_work")
+    reconstruct = bool(cfg.get("reconstruct_injections", False))
+    kg_url = cfg.get("kg_url", "http://100.102.191.30:18830/context")
+    kg_timeout = float(cfg.get("kg_timeout_s", 3.0))
+    trace_source = (
+        "organic_work_with_replay_injection"
+        if reconstruct and base_trace_source == "organic_work"
+        else base_trace_source
+    )
 
     if path.is_file():
         files = [path]
@@ -376,6 +391,8 @@ async def _iter_claude_jsonl(cfg: dict, max_records: int | None):
             ):
                 if max_records and count >= max_records:
                     break
+                if reconstruct:
+                    await _attach_replay_injection(record, kg_url, kg_timeout)
                 yield record
                 count += 1
                 if count % 50 == 0:
@@ -383,6 +400,50 @@ async def _iter_claude_jsonl(cfg: dict, max_records: int | None):
         except Exception:
             # Skip malformed files; never crash the whole run on one bad transcript
             continue
+
+
+async def _attach_replay_injection(record: dict, kg_url: str, timeout_s: float) -> None:
+    """Query the personal-KG /context endpoint with the turn's user prompt and
+    prepend the result as a synthetic memory_call. Mirrors the runtime hook
+    behavior so historical traces gain the memory-conditioning signal that
+    was injected at runtime but never persisted (MAD-164)."""
+    user_text = record["messages"][0]["content"] if record["messages"] else ""
+    if not user_text:
+        return
+    query = user_text[:500]
+    context = await asyncio.to_thread(_kg_context_request, kg_url, query, timeout_s)
+    if context is None:
+        return  # request failed — leave the trace unenriched
+    success = bool(context.strip())
+    synthetic_call = {
+        "tool_name": "personal-kg-context-replay",
+        "operation_type": "search",
+        "query": query,
+        "results": context,
+        "result_count": context.count("\n[") + (1 if context.strip() else 0),
+        "success": success,
+        "latency_ms": None,
+        "timestamp": record["trace"].get("timestamp", ""),
+    }
+    record["trace"]["memory_calls"] = [synthetic_call] + record["trace"]["memory_calls"]
+
+
+def _kg_context_request(url: str, query: str, timeout_s: float) -> str | None:
+    """Sync HTTP call to the KG /context endpoint. Returns the context string,
+    or None on any failure (which is logged-but-not-fatal at the call site)."""
+    import urllib.request
+    try:
+        payload = json.dumps({"query": query}).encode()
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            return json.loads(resp.read().decode()).get("context", "")
+    except Exception:
+        return None
 
 
 async def _parse_claude_session(
