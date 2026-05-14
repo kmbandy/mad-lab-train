@@ -827,7 +827,7 @@ All records are ChatML messages format. `calibration` records have no assistant 
 
 | Field | Type | Default | Required |
 |-------|------|---------|----------|
-| `type` | `huggingface \| zim \| qdrant \| duckdb \| raw` | — | yes |
+| `type` | `huggingface \| zim \| qdrant \| duckdb \| raw \| claude_jsonl` | — | yes |
 | `purpose` | `training \| context \| calibration` | `training` | no |
 | `max_records` | `int \| null` | `null` | no |
 
@@ -875,6 +875,19 @@ All records are ChatML messages format. `calibration` records have no assistant 
 |-------|------|---------|----------|
 | `path` | `string` | — | yes |
 | `schema.format` | `messages \| text \| instruction_response \| qa` | `messages` | no |
+
+**SourceConfig — `claude_jsonl`:**
+
+Mines Claude Code (or compatible agent) JSONL session transcripts into MAD-162-shaped trace records for memory-conditioned routing training (MAD-161). Each emitted record includes a top-level `messages` list (pipeline-compat) and a `trace` sidecar with `memory_calls`, session metadata, and provenance.
+
+| Field | Type | Default | Required |
+|-------|------|---------|----------|
+| `path` | `string` | — | yes (file or directory) |
+| `recursive` | `bool` | `true` | no (directory mode only) |
+| `unit` | `turn \| session` | `turn` | no |
+| `min_turn_chars` | `int` | `0` | no |
+| `agent` | `string` | `claude-code` | no (provenance tag) |
+| `trace_source` | `organic_work \| organic_work_with_replay_injection \| programmatic_task \| benchmark \| seeded_synthetic \| captured_hook_injection` | `organic_work` | no |
 
 ### 8.2 data_gen
 
