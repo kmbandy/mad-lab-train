@@ -888,6 +888,29 @@ Mines Claude Code (or compatible agent) JSONL session transcripts into MAD-162-s
 | `min_turn_chars` | `int` | `0` | no |
 | `agent` | `string` | `claude-code` | no (provenance tag) |
 | `trace_source` | `organic_work \| organic_work_with_replay_injection \| programmatic_task \| benchmark \| seeded_synthetic \| captured_hook_injection` | `organic_work` | no |
+| `reconstruct_injections` | `bool` | `false` | no — when `true`, each turn is enriched by querying the personal-KG `/context` endpoint with the user prompt (mirroring the runtime hook) and attaching the result as a synthetic `personal-kg-context-replay` memory_call. Trace_source auto-promotes to `organic_work_with_replay_injection`. |
+| `kg_url` | `string` | `http://100.102.191.30:18830/context` | no (reconstruct_injections only) |
+| `kg_timeout_s` | `float` | `3.0` | no (reconstruct_injections only) |
+| `annotate_spans` | `bool` | `false` | no — when `true`, applies span-annotation tiers (verbatim → paraphrase → reasoning) to the assistant output. Span lists populated on the record's `trace`. |
+| `span_min_match` | `int` | `30` | no (tier-1) — minimum char length for a verbatim retrieved span. |
+| `span_max_blob_chars` | `int` | `200000` | no (tier-1) — cap on concatenated `memory_call.results` to keep difflib tractable. |
+| `embedding_url` | `string \| null` | `null` | no (tier-2) — OpenAI-compatible /embeddings endpoint. When set with `embedding_model`, paraphrase detection runs after the verbatim pass. |
+| `embedding_model` | `string \| null` | `null` | no (tier-2) — model name sent in the embeddings request payload. No default; must be provided. |
+| `paraphrase_threshold` | `float 0–1` | `0.75` | no (tier-2) — min cosine similarity to mark an assistant sentence as a paraphrased retrieved span. |
+| `paraphrase_min_chars` | `int` | `40` | no (tier-2) — sentence-fragment length floor for the paraphrase pass. |
+| `embedding_timeout_s` | `float` | `10.0` | no (tier-2) |
+| `labeler` | `LabelerConfig \| null` | `null` | no (tier-3) — when present, an LLM worker pool labels remaining generation spans as REASONING vs GENERATION. See LabelerConfig below. |
+
+**LabelerConfig (tier-3 span annotation, reuses data_gen's WorkerPool):**
+
+| Field | Type | Default | Required |
+|-------|------|---------|----------|
+| `workers` | `list[WorkerConfig]` | — | yes — local llama.cpp endpoints; see §8.2 WorkerConfig — local. No default model. |
+| `model` | `string` | `""` | no — passed for endpoint validation; the actual model is whatever the server hosts. |
+| `sample_rate` | `float 0–1` | `0.1` | no — fraction of records to label (deterministic per session_id+timestamp). |
+| `quality_audit` | `int` | `100` | no — reserved; spot-check N labeled records for downstream review. |
+| `temperature` | `float` | `0.0` | no |
+| `max_tokens` | `int` | `64` | no |
 
 ### 8.2 data_gen
 

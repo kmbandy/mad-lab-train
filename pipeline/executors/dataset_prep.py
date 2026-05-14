@@ -367,6 +367,15 @@ async def _iter_claude_jsonl(cfg: dict, max_records: int | None):
     reconstruct = bool(cfg.get("reconstruct_injections", False))
     kg_url = cfg.get("kg_url", "http://100.102.191.30:18830/context")
     kg_timeout = float(cfg.get("kg_timeout_s", 3.0))
+    annotate_spans = bool(cfg.get("annotate_spans", False))
+    span_min_match = int(cfg.get("span_min_match", 30))
+    span_max_blob_chars = int(cfg.get("span_max_blob_chars", 200_000))
+    embedding_url = cfg.get("embedding_url")
+    embedding_model = cfg.get("embedding_model")
+    paraphrase_threshold = float(cfg.get("paraphrase_threshold", 0.75))
+    paraphrase_min_chars = int(cfg.get("paraphrase_min_chars", 40))
+    embedding_timeout = float(cfg.get("embedding_timeout_s", 10.0))
+    labeler_cfg = cfg.get("labeler") if annotate_spans else None
     trace_source = (
         "organic_work_with_replay_injection"
         if reconstruct and base_trace_source == "organic_work"
@@ -381,25 +390,56 @@ async def _iter_claude_jsonl(cfg: dict, max_records: int | None):
     else:
         return
 
+    # Tier-3 labeler setup is async/lifecycle-bound — set up once before the
+    # file walk, tear down in `finally` so workers are always released.
+    labeler_pool = None
+    labeler_sample_rate = 0.0
+    labeler_temperature = 0.0
+    labeler_max_tokens = 64
+    if labeler_cfg and labeler_cfg.get("workers"):
+        labeler_pool = await _setup_labeler_pool(labeler_cfg)
+        labeler_sample_rate = float(labeler_cfg.get("sample_rate", 0.1))
+        labeler_temperature = float(labeler_cfg.get("temperature", 0.0))
+        labeler_max_tokens = int(labeler_cfg.get("max_tokens", 64))
+
     count = 0
-    for file_path in files:
-        if max_records and count >= max_records:
-            break
-        try:
-            async for record in _parse_claude_session(
-                file_path, unit, min_turn_chars, agent, trace_source
-            ):
-                if max_records and count >= max_records:
-                    break
-                if reconstruct:
-                    await _attach_replay_injection(record, kg_url, kg_timeout)
-                yield record
-                count += 1
-                if count % 50 == 0:
-                    await asyncio.sleep(0)
-        except Exception:
-            # Skip malformed files; never crash the whole run on one bad transcript
-            continue
+    try:
+        for file_path in files:
+            if max_records and count >= max_records:
+                break
+            try:
+                async for record in _parse_claude_session(
+                    file_path, unit, min_turn_chars, agent, trace_source
+                ):
+                    if max_records and count >= max_records:
+                        break
+                    if reconstruct:
+                        await _attach_replay_injection(record, kg_url, kg_timeout)
+                    if annotate_spans:
+                        _annotate_spans_heuristic(record, span_min_match, span_max_blob_chars)
+                        if embedding_url and embedding_model:
+                            await _annotate_spans_paraphrase(
+                                record,
+                                embedding_url,
+                                embedding_model,
+                                paraphrase_threshold,
+                                paraphrase_min_chars,
+                                embedding_timeout,
+                            )
+                        if labeler_pool is not None and _should_label(record, labeler_sample_rate):
+                            await _annotate_spans_labeler(
+                                record, labeler_pool, labeler_temperature, labeler_max_tokens
+                            )
+                    yield record
+                    count += 1
+                    if count % 50 == 0:
+                        await asyncio.sleep(0)
+            except Exception:
+                # Skip malformed files; never crash the whole run on one bad transcript
+                continue
+    finally:
+        if labeler_pool is not None:
+            await _teardown_labeler_pool(labeler_pool)
 
 
 async def _attach_replay_injection(record: dict, kg_url: str, timeout_s: float) -> None:
@@ -444,6 +484,370 @@ def _kg_context_request(url: str, query: str, timeout_s: float) -> str | None:
             return json.loads(resp.read().decode()).get("context", "")
     except Exception:
         return None
+
+
+def _annotate_spans_heuristic(record: dict, min_match: int, max_blob_chars: int) -> None:
+    """Tier-1 span annotation: verbatim substring matching (MAD-164 step 3).
+
+    Walks the assistant output and marks any substring of length >= min_match
+    that appears verbatim in any memory_call's `results` content as a
+    retrieved_span. Everything else becomes a generation_span. reasoning_spans
+    are left for tier-3 LLM labeling (deferred).
+
+    High precision, lower recall by design. Catches the obvious copy-paste
+    (code blocks, file paths, quoted text, error messages) that gives the
+    memory-conditioned router its strongest, cheapest signal.
+    """
+    if len(record["messages"]) < 2:
+        return
+    asst_text = record["messages"][1].get("content", "")
+    if not asst_text:
+        return
+
+    blob = _collect_retrieved_blob(record, max_blob_chars)
+    if not blob:
+        record["trace"]["generation_spans"] = [(0, len(asst_text))]
+        return
+
+    retrieved = _verbatim_matches(asst_text, blob, min_match)
+    record["trace"]["retrieved_spans"] = retrieved
+    record["trace"]["generation_spans"] = _complement_spans(retrieved, len(asst_text))
+    # reasoning_spans intentionally untouched — populated by tier-3 LLM pass
+
+
+def _collect_retrieved_blob(record: dict, max_chars: int) -> str:
+    """Flatten every memory_call's results content into one searchable blob.
+
+    Caps total length at `max_chars` to keep difflib's matching tractable on
+    sessions with huge tool dumps (large file reads, repo greps, etc.)."""
+    parts: list[str] = []
+    total = 0
+    for call in record["trace"].get("memory_calls", []):
+        for text in _iter_result_text(call.get("results")):
+            if not text:
+                continue
+            remaining = max_chars - total
+            if remaining <= 0:
+                return "\n".join(parts)
+            if len(text) > remaining:
+                parts.append(text[:remaining])
+                return "\n".join(parts)
+            parts.append(text)
+            total += len(text) + 1  # +1 for the join separator
+    return "\n".join(parts)
+
+
+def _iter_result_text(results):
+    """Yield string fragments from a memory_call.results value, regardless of
+    shape (None, str, list of strings, list of {type, text} blocks, etc.)."""
+    if results is None:
+        return
+    if isinstance(results, str):
+        yield results
+        return
+    if isinstance(results, list):
+        for item in results:
+            if isinstance(item, str):
+                yield item
+            elif isinstance(item, dict):
+                # tool_result blocks commonly look like {"type": "text", "text": "..."}
+                text = item.get("text") or item.get("content") or ""
+                if isinstance(text, str):
+                    yield text
+                elif isinstance(text, list):
+                    yield from _iter_result_text(text)
+        return
+    if isinstance(results, dict):
+        text = results.get("text") or results.get("content") or ""
+        if isinstance(text, str):
+            yield text
+
+
+def _verbatim_matches(asst_text: str, blob: str, min_match: int) -> list[tuple[int, int]]:
+    """Find non-overlapping substrings of `asst_text` of length >= min_match
+    that appear in `blob`. Returns a sorted, merged list of (start, end) tuples
+    indexing into asst_text."""
+    import difflib
+    matcher = difflib.SequenceMatcher(None, asst_text, blob, autojunk=False)
+    spans: list[tuple[int, int]] = []
+    for block in matcher.get_matching_blocks():
+        if block.size >= min_match:
+            spans.append((block.a, block.a + block.size))
+    return _merge_spans(spans)
+
+
+def _merge_spans(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Sort and union overlapping/adjacent span ranges."""
+    if not spans:
+        return []
+    ordered = sorted(spans)
+    merged: list[tuple[int, int]] = [ordered[0]]
+    for start, end in ordered[1:]:
+        last_start, last_end = merged[-1]
+        if start <= last_end:
+            merged[-1] = (last_start, max(last_end, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _complement_spans(retrieved: list[tuple[int, int]], total_len: int) -> list[tuple[int, int]]:
+    """Compute the spans of asst_text NOT covered by `retrieved` — these are
+    generation spans by default. Tier-3 LLM labeling may later reclassify
+    some of these as reasoning_spans."""
+    gens: list[tuple[int, int]] = []
+    cursor = 0
+    for start, end in retrieved:
+        if start > cursor:
+            gens.append((cursor, start))
+        cursor = max(cursor, end)
+    if cursor < total_len:
+        gens.append((cursor, total_len))
+    return gens
+
+
+async def _annotate_spans_paraphrase(
+    record: dict,
+    embedding_url: str,
+    embedding_model: str,
+    threshold: float,
+    min_chars: int,
+    timeout_s: float,
+) -> None:
+    """Tier-2 span annotation: paraphrase detection via remote embeddings (MAD-164).
+
+    Splits the un-retrieved portion of the assistant output into sentences,
+    chunks the retrieved blob the same way, embeds both sides through an
+    OpenAI-compatible /embeddings HTTP service, and marks any assistant
+    sentence whose max cosine similarity to a retrieved chunk exceeds
+    `threshold` as a retrieved_span. Runs after the tier-1 verbatim pass —
+    only candidates that survive tier 1 (i.e. are still in generation_spans)
+    are submitted, which keeps embedding load proportional to novelty rather
+    than total session length."""
+    if len(record["messages"]) < 2:
+        return
+    asst_text = record["messages"][1].get("content", "")
+    if not asst_text:
+        return
+
+    blob_chars_cap = 200_000  # mirror heuristic cap
+    blob = _collect_retrieved_blob(record, blob_chars_cap)
+    if not blob:
+        return
+
+    # Candidate sentences: only the slices of asst_text that tier 1 left as
+    # generation_spans, further split on sentence-ish boundaries.
+    gen_spans = record["trace"].get("generation_spans", [])
+    candidates: list[tuple[int, int]] = []
+    for span_start, span_end in gen_spans:
+        for s, e in _split_into_sentences(asst_text, span_start, span_end):
+            if e - s >= min_chars:
+                candidates.append((s, e))
+    if not candidates:
+        return
+
+    # Reference chunks from the retrieved blob, same sentence split.
+    ref_chunks_full = list(_split_into_sentences(blob, 0, len(blob)))
+    ref_chunks = [(s, e) for s, e in ref_chunks_full if e - s >= min_chars]
+    if not ref_chunks:
+        return
+
+    candidate_texts = [asst_text[s:e] for s, e in candidates]
+    reference_texts = [blob[s:e] for s, e in ref_chunks]
+
+    cand_emb = await asyncio.to_thread(
+        _embed_via_http, embedding_url, embedding_model, candidate_texts, timeout_s
+    )
+    if cand_emb is None:
+        return
+    ref_emb = await asyncio.to_thread(
+        _embed_via_http, embedding_url, embedding_model, reference_texts, timeout_s
+    )
+    if ref_emb is None:
+        return
+
+    new_spans: list[tuple[int, int]] = []
+    for (cstart, cend), c_vec in zip(candidates, cand_emb):
+        if _max_cosine(c_vec, ref_emb) >= threshold:
+            new_spans.append((cstart, cend))
+
+    if not new_spans:
+        return
+
+    merged_retrieved = _merge_spans(record["trace"]["retrieved_spans"] + new_spans)
+    record["trace"]["retrieved_spans"] = merged_retrieved
+    record["trace"]["generation_spans"] = _complement_spans(merged_retrieved, len(asst_text))
+
+
+def _split_into_sentences(text: str, start: int, end: int):
+    """Yield (start, end) char offsets into `text` for sentence-like fragments
+    within the [start, end) range. Cheap delimiter split — `. `, `? `, `! `,
+    newlines. Returns half-open intervals."""
+    if end <= start:
+        return
+    cursor = start
+    for i in range(start, end):
+        ch = text[i]
+        if ch in ".?!" and i + 1 < end and text[i + 1] in (" ", "\n"):
+            yield (cursor, i + 1)
+            cursor = i + 2
+        elif ch == "\n" and i > cursor:
+            yield (cursor, i)
+            cursor = i + 1
+    if cursor < end:
+        yield (cursor, end)
+
+
+def _embed_via_http(url: str, model: str, inputs: list[str], timeout_s: float) -> list[list[float]] | None:
+    """POST an OpenAI-compatible /embeddings request and return the vectors.
+
+    Body: {"model": "...", "input": [...]} → {"data": [{"embedding": [...]}, ...]}
+    Returns None on any failure — caller treats as a soft skip."""
+    import urllib.request
+    if not inputs:
+        return []
+    try:
+        payload = json.dumps({"model": model, "input": inputs}).encode()
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            body = json.loads(resp.read().decode())
+        data = body.get("data") or []
+        if len(data) != len(inputs):
+            return None
+        return [item.get("embedding") or [] for item in data]
+    except Exception:
+        return None
+
+
+async def _setup_labeler_pool(labeler_cfg: dict):
+    """Bring up a WorkerPool of llama.cpp-compatible servers for tier-3 span
+    labeling. Reuses the data_gen worker abstraction so workers are configured
+    identically across stages."""
+    from pipeline.executors.workers import Worker, WorkerConfig, WorkerPool
+
+    workers = []
+    for w_cfg in labeler_cfg.get("workers", []):
+        if w_cfg.get("type") != "local":
+            continue
+        worker = Worker(WorkerConfig(
+            type="local",
+            host=w_cfg.get("host", "localhost"),
+            port=int(w_cfg.get("port", 8080)),
+            parallel=int(w_cfg.get("parallel", 16)),
+            model=labeler_cfg.get("model", ""),
+        ))
+        await worker.connect()
+        if await worker.health_check():
+            workers.append(worker)
+        else:
+            await worker.close()
+    return WorkerPool(workers) if workers else None
+
+
+async def _teardown_labeler_pool(pool) -> None:
+    for worker in pool.workers:
+        try:
+            await worker.close()
+        except Exception:
+            pass
+
+
+def _should_label(record: dict, sample_rate: float) -> bool:
+    """Deterministic-by-record sampling: keeps repeat runs over the same
+    corpus stable, so quality audits target the same N records each time."""
+    if sample_rate <= 0:
+        return False
+    if sample_rate >= 1:
+        return True
+    key = (record["trace"].get("session_id", "") + record["trace"].get("timestamp", "")).encode()
+    bucket = int(hashlib.sha256(key).hexdigest()[:8], 16) / 0xFFFFFFFF
+    return bucket < sample_rate
+
+
+_LABELER_SYSTEM_PROMPT = (
+    "You classify a fragment of an AI assistant's response. The assistant has "
+    "access to retrieved context (memory, search results, tool output). Decide "
+    "whether the fragment is REASONING (synthesis, integration, or commentary "
+    "on retrieved content) or GENERATION (independent content not grounded in "
+    "anything retrieved). Reply with a single word: REASONING or GENERATION."
+)
+
+
+async def _annotate_spans_labeler(record: dict, pool, temperature: float, max_tokens: int) -> None:
+    """Tier-3 span annotation: LLM-based reasoning/generation labeling (MAD-164).
+
+    For each span tier 1+2 left in generation_spans, asks the labeler whether
+    the fragment is REASONING (synthesizes retrieved content) or GENERATION
+    (independent). Reasoning-labeled spans move to reasoning_spans; the rest
+    stay in generation_spans. Subject to sample_rate at the iterator level."""
+    if len(record["messages"]) < 2:
+        return
+    asst_text = record["messages"][1].get("content", "")
+    if not asst_text:
+        return
+    gen_spans = list(record["trace"].get("generation_spans", []))
+    if not gen_spans:
+        return
+
+    reasoning: list[tuple[int, int]] = []
+    new_gens: list[tuple[int, int]] = []
+    for start, end in gen_spans:
+        fragment = asst_text[start:end].strip()
+        if len(fragment) < 40:
+            new_gens.append((start, end))
+            continue
+        worker = pool.pick()
+        if worker is None:
+            new_gens.append((start, end))
+            continue
+        messages = [
+            {"role": "system", "content": _LABELER_SYSTEM_PROMPT},
+            {"role": "user", "content": fragment[:2000]},
+        ]
+        try:
+            verdict = await worker.generate(messages, temperature, max_tokens)
+        except Exception:
+            verdict = None
+        if verdict and "REASONING" in verdict.upper():
+            reasoning.append((start, end))
+        else:
+            new_gens.append((start, end))
+
+    if reasoning:
+        record["trace"]["reasoning_spans"] = _merge_spans(
+            record["trace"].get("reasoning_spans", []) + reasoning
+        )
+        record["trace"]["generation_spans"] = _merge_spans(new_gens)
+
+
+def _max_cosine(vec: list[float], refs: list[list[float]]) -> float:
+    """Max cosine similarity of `vec` against any reference vector. Pure-Python
+    so the iterator stays free of numpy/torch deps; OK at sentence scale."""
+    if not vec or not refs:
+        return 0.0
+    v_norm = sum(x * x for x in vec) ** 0.5
+    if v_norm == 0:
+        return 0.0
+    best = 0.0
+    for ref in refs:
+        if not ref or len(ref) != len(vec):
+            continue
+        dot = 0.0
+        r_norm = 0.0
+        for a, b in zip(vec, ref):
+            dot += a * b
+            r_norm += b * b
+        if r_norm == 0:
+            continue
+        sim = dot / (v_norm * (r_norm ** 0.5))
+        if sim > best:
+            best = sim
+    return best
 
 
 async def _parse_claude_session(
