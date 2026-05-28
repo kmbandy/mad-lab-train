@@ -97,6 +97,8 @@ def main() -> None:
             arch_dict = json.load(f)
 
     model_type = arch_dict.pop("model_type", "llama")
+    if model_type == "mlambaformer":
+        import mlambaformer  # noqa: F401
     arch_dict.setdefault("vocab_size", len(tokenizer))
     model_config = AutoConfig.for_model(model_type, **arch_dict)
     model = AutoModelForCausalLM.from_config(model_config)
@@ -185,7 +187,8 @@ def main() -> None:
     # ── SFTConfig with DeepSpeed ───────────────────────────────────────────────
     ds_config = _deepspeed_config(zero_stage, bf16, fp16)
 
-    sft_config = SFTConfig(
+    data_format = cfg.get("data_format", "messages")
+    common = dict(
         output_dir=str(out_dir),
         num_train_epochs=int(train_cfg.get("epochs", 3)),
         per_device_train_batch_size=int(train_cfg.get("micro_batch_size", 1)),
@@ -205,19 +208,24 @@ def main() -> None:
         logging_steps=int(train_cfg.get("logging_steps", 10)),
         report_to="none",
         max_seq_length=int(cfg.get("max_seq_length", 2048)),
-        dataset_text_field=None,
         deepspeed=ds_config,
     )
-
-    trainer = SFTTrainer(
-        model=model,
-        args=sft_config,
-        train_dataset=train_ds,
-        eval_dataset=eval_ds,
-        formatting_func=_format,
-        processing_class=tokenizer,
-        callbacks=[_WorkerCallback()],
-    )
+    if data_format == "text":
+        # raw-text CLM pretraining: pack the `text` field, no chat template
+        sft_config = SFTConfig(**common, dataset_text_field="text", packing=True)
+        trainer = SFTTrainer(
+            model=model, args=sft_config,
+            train_dataset=train_ds, eval_dataset=eval_ds,
+            processing_class=tokenizer, callbacks=[_WorkerCallback()],
+        )
+    else:
+        sft_config = SFTConfig(**common, dataset_text_field=None)
+        trainer = SFTTrainer(
+            model=model, args=sft_config,
+            train_dataset=train_ds, eval_dataset=eval_ds,
+            formatting_func=_format, processing_class=tokenizer,
+            callbacks=[_WorkerCallback()],
+        )
 
     from pipeline.executors.finetune import _find_latest_checkpoint
     resume_from = _find_latest_checkpoint(out_dir)

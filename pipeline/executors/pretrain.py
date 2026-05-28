@@ -201,7 +201,8 @@ class PretrainExecutor(BaseExecutor):
                         control.should_training_stop = True
 
             # ── SFTConfig ──────────────────────────────────────────────────────
-            sft_config = SFTConfig(
+            data_format = cfg.get("data_format", "messages")
+            common = dict(
                 output_dir=str(out_dir),
                 num_train_epochs=int(train_cfg.get("epochs", 3)),
                 per_device_train_batch_size=int(train_cfg.get("micro_batch_size", 1)),
@@ -221,18 +222,23 @@ class PretrainExecutor(BaseExecutor):
                 logging_steps=int(train_cfg.get("logging_steps", 10)),
                 report_to="none",
                 max_seq_length=int(cfg.get("max_seq_length", 2048)),
-                dataset_text_field=None,
             )
-
-            trainer = SFTTrainer(
-                model=model,
-                args=sft_config,
-                train_dataset=train_ds,
-                eval_dataset=eval_ds,
-                formatting_func=_format,
-                processing_class=tokenizer,
-                callbacks=[_PipelineCallback()],
-            )
+            if data_format == "text":
+                # raw-text CLM pretraining: pack the `text` field, no chat template
+                sft_config = SFTConfig(**common, dataset_text_field="text", packing=True)
+                trainer = SFTTrainer(
+                    model=model, args=sft_config,
+                    train_dataset=train_ds, eval_dataset=eval_ds,
+                    processing_class=tokenizer, callbacks=[_PipelineCallback()],
+                )
+            else:
+                sft_config = SFTConfig(**common, dataset_text_field=None)
+                trainer = SFTTrainer(
+                    model=model, args=sft_config,
+                    train_dataset=train_ds, eval_dataset=eval_ds,
+                    formatting_func=_format, processing_class=tokenizer,
+                    callbacks=[_PipelineCallback()],
+                )
 
             from pipeline.executors.finetune import _find_latest_checkpoint
             resume_from = _find_latest_checkpoint(out_dir)
@@ -323,6 +329,8 @@ def _load_architecture(arch_path: str, vocab_size: int):
             arch_dict = json.load(f)
 
     model_type = arch_dict.pop("model_type", "llama")
+    if model_type == "mlambaformer":
+        import mlambaformer  # noqa: F401  registers config + model with HF Auto*
     # Ensure vocab_size is consistent with tokenizer
     arch_dict.setdefault("vocab_size", vocab_size)
     return AutoConfig.for_model(model_type, **arch_dict)
