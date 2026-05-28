@@ -1,0 +1,29 @@
+services:
+  train:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      additional_contexts:
+        mlambaformer: ../../mlambaformer
+      args:
+        INSTALL_MODE: ${INSTALL_MODE:-release}
+        ROCM_BASE: ${ROCM_BASE:-rocm/dev-ubuntu-22.04:7.2.3-complete}
+    image: mlambaformer-train:latest
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add: [video, render]
+    security_opt: ["seccomp=unconfined"]
+    ipc: host
+    shm_size: "16gb"
+    environment:
+      HSA_VISIBLE_DEVICES: ${HSA_VISIBLE_DEVICES:-0}
+      PORT: 8848
+    ports: ["8848:8848"]
+    volumes:
+      - /mnt/hdd/corpus:/mnt/hdd/corpus:ro
+      - ./_runs:/workspace/runs
+      - ./_db:/workspace/db
+    # dev override: live source. Comment out for release builds.
+    # - ../../mlambaformer:/src/mlambaformer
+    # - ..:/src/mad-lab-train
