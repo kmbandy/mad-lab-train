@@ -1,0 +1,4 @@
+# Pin torch to the in-image custom ROCm build. Every `pip install` in the
+# runtime stage passes `-c docker/constraints.txt` so no transitive dependency
+# can pull a PyPI torch wheel over the custom gfx1030;gfx1201 build.
+torch==2.13.0a0
