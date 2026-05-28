@@ -33,13 +33,18 @@ RUN pip install --no-cache-dir /tmp/wheels/*.whl
 # 2) training stack — constraints prevent any transitive PyPI torch
 RUN pip install --no-cache-dir -c /tmp/constraints.txt \
         "transformers>=4.57,<4.60" "trl>=0.12,<0.16" "datasets>=2.19" \
-        "accelerate>=0.34" "deepspeed>=0.14" sentencepiece pyyaml
+        "accelerate>=0.34" "deepspeed>=0.14" sentencepiece pyyaml aiosqlite
 
-# 3) the two repos
+# 3) the two repos. mad-lab-train installed WITH deps (under constraints) so the
+#    FastAPI server + SQLAlchemy orchestrator stack is present for serve AND run modes.
+#    torch is already installed (step 1) so the constraints pin keeps it; no PyPI torch.
+#    NOTE: mad-lab-train's deps include bitsandbytes + mergekit (heavy; mergekit pulls
+#    torch, satisfied by the existing build). If either fails the ROCm build, revisit
+#    by moving them to an optional extra — do NOT silently drop server deps.
 ARG INSTALL_MODE=release
 RUN --mount=type=bind,source=.,target=/src/mad-lab-train,rw \
     if [ "$INSTALL_MODE" = "release" ]; then \
-        pip install --no-cache-dir --no-deps /src/mad-lab-train ; \
+        pip install --no-cache-dir -c /tmp/constraints.txt /src/mad-lab-train ; \
     fi
 COPY --from=mlambaformer . /src/mlambaformer
 RUN pip install --no-cache-dir -c /tmp/constraints.txt /src/mlambaformer
