@@ -210,13 +210,16 @@ def main() -> None:
         max_seq_length=int(cfg.get("max_seq_length", 2048)),
         deepspeed=ds_config,
     )
+    from pipeline.executors._quant_native_callbacks import mlambaformer_quant_callbacks
+    quant_cbs = mlambaformer_quant_callbacks(model)
     if data_format == "text":
         # raw-text CLM pretraining: pack the `text` field, no chat template
         sft_config = SFTConfig(**common, dataset_text_field="text", packing=True)
         trainer = SFTTrainer(
             model=model, args=sft_config,
             train_dataset=train_ds, eval_dataset=eval_ds,
-            processing_class=tokenizer, callbacks=[_WorkerCallback()],
+            processing_class=tokenizer,
+            callbacks=[_WorkerCallback(), *quant_cbs],
         )
     else:
         sft_config = SFTConfig(**common, dataset_text_field=None)
