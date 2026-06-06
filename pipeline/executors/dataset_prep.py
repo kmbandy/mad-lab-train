@@ -10,6 +10,7 @@ from pathlib import Path
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from pipeline.executors.base import BaseExecutor
+from pipeline.conversation_messages import events_to_messages
 
 _DATASETS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS records (
@@ -362,6 +363,10 @@ async def _iter_claude_jsonl(cfg: dict, max_records: int | None):
     recursive = bool(cfg.get("recursive", True))
     unit = cfg.get("unit", "turn")
     min_turn_chars = int(cfg.get("min_turn_chars", 0))
+    # include_tools: emit FULL block-ordered messages (assistant tool_calls +
+    # role:'tool' turns) instead of user+assistant-prose. The `trace` sidecar is
+    # unchanged, so memory-trace consumers (default flag off) are unaffected.
+    include_tools = bool(cfg.get("include_tools", False))
     agent = cfg.get("agent", "claude-code")
     base_trace_source = cfg.get("trace_source", "organic_work")
     reconstruct = bool(cfg.get("reconstruct_injections", False))
@@ -409,7 +414,7 @@ async def _iter_claude_jsonl(cfg: dict, max_records: int | None):
                 break
             try:
                 async for record in _parse_claude_session(
-                    file_path, unit, min_turn_chars, agent, trace_source
+                    file_path, unit, min_turn_chars, agent, trace_source, include_tools
                 ):
                     if max_records and count >= max_records:
                         break
@@ -856,6 +861,7 @@ async def _parse_claude_session(
     min_turn_chars: int,
     agent: str,
     trace_source: str,
+    include_tools: bool = False,
 ):
     """Parse one Claude Code JSONL session into MAD-162 turn records.
 
@@ -906,6 +912,8 @@ async def _parse_claude_session(
                     "tool_results": {},
                     "started_at": timestamp,
                     "model": None,
+                    # ordered event stream for include_tools rendering (additive)
+                    "events": [{"kind": "user", "text": content}],
                 }
             elif isinstance(content, list):
                 if current is None:
@@ -919,6 +927,12 @@ async def _parse_claude_session(
                             "content": block.get("content", ""),
                             "is_error": block.get("is_error", False),
                         }
+                        current["events"].append({
+                            "kind": "tool_result",
+                            "tool_use_id": tuid,
+                            "content": block.get("content", ""),
+                            "is_error": block.get("is_error", False),
+                        })
 
         elif t == "assistant":
             if current is None:
@@ -932,6 +946,7 @@ async def _parse_claude_session(
                     btype = block.get("type")
                     if btype == "text":
                         current["assistant_text_parts"].append(block.get("text", ""))
+                        current["events"].append({"kind": "assistant", "text": block.get("text", "")})
                     elif btype == "tool_use":
                         current["tool_uses"].append({
                             "id": block.get("id", ""),
@@ -939,8 +954,15 @@ async def _parse_claude_session(
                             "input": block.get("input", {}),
                             "timestamp": timestamp,
                         })
+                        current["events"].append({
+                            "kind": "tool_use",
+                            "id": block.get("id", ""),
+                            "name": block.get("name", ""),
+                            "input": block.get("input", {}),
+                        })
             elif isinstance(content, str):
                 current["assistant_text_parts"].append(content)
+                current["events"].append({"kind": "assistant", "text": content})
 
     if current is not None:
         turns.append(current)
@@ -955,9 +977,13 @@ async def _parse_claude_session(
         all_calls: list[dict] = []
         for t in turns:
             all_calls.extend(_build_memory_calls(t))
+        msgs = None
+        if include_tools:
+            all_events = [e for t in turns for e in t["events"]]
+            msgs = events_to_messages(all_events)
         yield _build_trace_record(
             all_user, all_asst, all_calls, session_meta, agent, trace_source,
-            turns[0]["started_at"], turns[0]["model"] or "",
+            turns[0]["started_at"], turns[0]["model"] or "", messages=msgs,
         )
         return
 
@@ -967,10 +993,11 @@ async def _parse_claude_session(
             continue
         if len(turn["user_text"]) + len(asst_text) < min_turn_chars:
             continue
+        msgs = events_to_messages(turn["events"]) if include_tools else None
         yield _build_trace_record(
             turn["user_text"], asst_text, _build_memory_calls(turn),
             session_meta, agent, trace_source,
-            turn["started_at"], turn["model"] or "",
+            turn["started_at"], turn["model"] or "", messages=msgs,
         )
 
 
@@ -1040,11 +1067,16 @@ def _build_trace_record(
     trace_source: str,
     started_at: str,
     model: str,
+    messages: list | None = None,
 ) -> dict:
     """Build a MAD-162-shaped record. `messages` keeps pipeline compat;
-    `trace` carries retrieval / provenance / span-annotation slots."""
+    `trace` carries retrieval / provenance / span-annotation slots.
+
+    When `messages` is supplied (include_tools path) it replaces the default
+    user+assistant-prose pair with full tool-interleaved turns; the `trace`
+    sidecar is identical either way."""
     return {
-        "messages": [
+        "messages": messages if messages is not None else [
             {"role": "user", "content": user_text},
             {"role": "assistant", "content": asst_text},
         ],
