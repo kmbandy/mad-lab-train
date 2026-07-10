@@ -1,23 +1,44 @@
+# Works with `docker compose` and `podman-compose`. On this box podman is what's
+# installed (5.8.3, rootless, no daemon).
+#
+# Rootless podman notes -- these differ from Docker and are easy to get wrong:
+#   * `group_add: [video, render]` does NOT work rootless. It was here before and is
+#     removed. /dev/kfd and /dev/dri/renderD* are mode 0666 on this box, so no group
+#     membership is needed at all. If you ever do need it, the podman CLI form is
+#     `--group-add keep-groups`, which compose cannot express.
+#   * `shm_size` together with `ipc: host` is REJECTED by podman
+#     ("cannot set shmsize when running in the {host } IPC Namespace"). With `ipc: host`
+#     the container uses the host's /dev/shm as-is, so shm_size was always redundant.
+#
+# GPU SELECTION: torch's cuda:0 is the R9700 (gfx1201, 32 GiB); cuda:1 is the RX 6900 XT
+# (gfx1030, 16 GiB). That is the INVERSE of rocm-smi's numbering, which calls the 6900 XT
+# GPU[0]. HSA_VISIBLE_DEVICES follows the HSA/torch order, so 0 = R9700. Leave it UNSET to
+# expose both -- but never set it to the empty string, which means "no devices" and
+# silently hides every GPU.
 services:
   train:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+      # mlambaformer is consumed as a named build context: the Dockerfile copies both its
+      # source tree and its docker/requirements.lock.txt (the pinned dependency closure).
+      #
+      # The `pytorch` build context that the old builder stage bind-mounted was never
+      # declared here, so that stage could not have built. The builder stage is now gone:
+      # torch==2.13.0+rocm7.2 ships gfx1030/gfx1201/gfx942/gfx950 as a stable wheel.
       additional_contexts:
         mlambaformer: ../../mlambaformer
       args:
         INSTALL_MODE: ${INSTALL_MODE:-release}
-        ROCM_BASE: ${ROCM_BASE:-rocm/dev-ubuntu-22.04:7.2.3-complete}
     image: mlambaformer-train:latest
     devices:
       - /dev/kfd
       - /dev/dri
-    group_add: [video, render]
     security_opt: ["seccomp=unconfined"]
     ipc: host
-    shm_size: "16gb"
     environment:
-      HSA_VISIBLE_DEVICES: ${HSA_VISIBLE_DEVICES:-0}
+      # Unset by default => both GPUs visible. Set to 0 to pin the R9700.
+      HSA_VISIBLE_DEVICES: ${HSA_VISIBLE_DEVICES:-}
       PORT: 8848
     ports: ["8848:8848"]
     volumes:

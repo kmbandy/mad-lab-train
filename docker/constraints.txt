@@ -1,4 +1,22 @@
-# Pin torch to the in-image custom ROCm build. Every `pip install` in the
-# runtime stage passes `-c docker/constraints.txt` so no transitive dependency
-# can pull a PyPI torch wheel over the custom gfx1030;gfx1201 build.
-torch==2.13.0a0
+# Pin the packages a transitive dependency would otherwise replace.
+# Every `pip install` in the image MUST pass `-c /opt/mlmf/constraints.txt`.
+#
+# torch: without this pin, pip resolves `torch` from PyPI for any dependency that
+# declares it, uninstalls the ROCm build, and installs a CUDA one. Not hypothetical --
+# on 2026-07-10 it happened twice in one morning in the mlambaformer host env:
+#   * torch-einops-utils                      -> torch 2.12.1+cu130 + 18 nvidia-* wheels
+#   * mamba_ssm (via tilelang, quack-kernels) -> torch 2.13.0+cu130, and it then COMPILED
+#     selective_scan_cuda.so against CUDA torch, on an AMD-only box.
+# The `+rocm7.2` local segment is part of the identity: omit it and pip treats the wheel
+# as a different distribution and happily "upgrades" over it.
+#
+# Was `torch==2.13.0a0` (the from-source builder-stage wheel). That builder stage is gone:
+# the stable +rocm7.2 wheel covers gfx1030, gfx1201, gfx942 and gfx950 -- a superset of
+# what the source build produced -- so there is nothing left to compile.
+torch==2.13.0+rocm7.2
+
+# transformers: mlambaformer needs the Zyphra fork, pinned to the same SHA as the vendored
+# ZAYA sources (9e5966ce285b3d19035c344490d8c561f95a5952). It reports version 4.57.1.
+# mad-lab-train's own requirement is `transformers>=4.57,<4.60`, which the fork satisfies --
+# but only if pip is forbidden from "upgrading" to a PyPI build with no Zaya model classes.
+transformers==4.57.1
