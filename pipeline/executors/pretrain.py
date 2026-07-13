@@ -399,6 +399,28 @@ def _train_tokenizer(
     for pattern in ("*.jsonl", "*.txt"):
         text_files.extend(corpus_dir.glob(pattern))
 
+    # MAD-327. This used to read ONLY obj["messages"]:
+    #
+    #     obj  = json.loads(line)
+    #     msgs = obj.get("messages", [])
+    #     for m in msgs:
+    #         yield m.get("content", "")
+    #
+    # For a raw-text pretraining corpus -- {"text": ...}, which is exactly what
+    # data_format: "text" / dataset_text_field="text" means -- `.get("messages", [])`
+    # returns [] and the loop yields NOTHING. The `except` only catches JSON *parse*
+    # failures, so a perfectly valid {"text": ...} line parsed fine and produced no
+    # training text at all.
+    #
+    # BPE therefore trained on an EMPTY ITERATOR and produced a byte-level vocab of
+    # 256 + 5 specials = 261 TOKENS. Then _load_architecture(arch, len(tokenizer)) built
+    # the model with vocab_size=261 instead of 32,000. Silently: the tokenizer "trained
+    # successfully" and emitted tokenizer_trained.
+    #
+    # Read BOTH shapes, and count what we actually emit so the guard below can tell an
+    # empty corpus from a real one.
+    stats = {"docs": 0, "chars": 0, "unusable_lines": 0}
+
     def _text_iter():
         for p in text_files:
             with open(p) as f:
@@ -408,11 +430,33 @@ def _train_tokenizer(
                         continue
                     try:
                         obj = json.loads(line)
-                        msgs = obj.get("messages", [])
-                        for m in msgs:
-                            yield m.get("content", "")
                     except Exception:
+                        # not JSON -- a plain .txt line is legitimate corpus text
+                        stats["docs"] += 1
+                        stats["chars"] += len(line)
                         yield line
+                        continue
+
+                    if not isinstance(obj, dict):
+                        stats["unusable_lines"] += 1
+                        continue
+
+                    emitted = False
+                    text = obj.get("text")
+                    if isinstance(text, str) and text:
+                        stats["docs"] += 1
+                        stats["chars"] += len(text)
+                        yield text
+                        emitted = True
+                    for m in obj.get("messages") or []:
+                        content = m.get("content", "") if isinstance(m, dict) else ""
+                        if content:
+                            stats["docs"] += 1
+                            stats["chars"] += len(content)
+                            yield content
+                            emitted = True
+                    if not emitted:
+                        stats["unusable_lines"] += 1
 
     bpe = ByteLevelBPETokenizer()
     bpe.train_from_iterator(
@@ -421,6 +465,32 @@ def _train_tokenizer(
         min_frequency=2,
         special_tokens=["<s>", "</s>", "<unk>", "<pad>", "<mask>"],
     )
+
+    # MAD-327 GUARD. A byte-level BPE trained on nothing still "succeeds" -- it just
+    # returns the 256 byte tokens plus the specials. That is what shipped. Fail loudly
+    # instead: a degenerate tokenizer silently becomes a degenerate MODEL, because
+    # _load_architecture takes its vocab_size from len(tokenizer).
+    trained_vocab = bpe.get_vocab_size()
+    if stats["docs"] == 0:
+        raise ValueError(
+            f"tokenizer training read {len(text_files)} file(s) from {corpus_dir} and "
+            f"extracted ZERO documents ({stats['unusable_lines']} lines had neither a "
+            f"'text' field nor 'messages'). BPE would have produced a "
+            f"{trained_vocab}-token byte vocabulary and the model would have been built "
+            f"with that as its vocab_size."
+        )
+    if trained_vocab <= 512:
+        raise ValueError(
+            f"tokenizer trained to only {trained_vocab} tokens from {stats['docs']:,} "
+            f"documents ({stats['chars']:,} chars) -- essentially no BPE merges were "
+            f"learned. Expected ~{vocab_size}. Refusing to build a model on this."
+        )
+    if trained_vocab < 0.9 * vocab_size:
+        emit_sync("tokenizer_undertrained", {
+            "trained_vocab": trained_vocab, "requested": vocab_size,
+            "docs": stats["docs"], "chars": stats["chars"],
+        })
+
     bpe.save_model(str(save_dir))
 
     tokenizer = PreTrainedTokenizerFast(
@@ -433,5 +503,11 @@ def _train_tokenizer(
     )
     tokenizer.save_pretrained(str(save_dir))
 
-    emit_sync("tokenizer_trained", {"vocab_size": tokenizer.vocab_size})
+    emit_sync("tokenizer_trained", {
+        "vocab_size": tokenizer.vocab_size,
+        "requested_vocab_size": vocab_size,
+        "docs": stats["docs"],
+        "chars": stats["chars"],
+        "unusable_lines": stats["unusable_lines"],
+    })
     return tokenizer
