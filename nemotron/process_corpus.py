@@ -1,3 +1,31 @@
+"""
+!! NOT THE MAD-160 CORPUS BUILDER. DO NOT POINT THIS AT configs/corpus/mad160.yaml. !!
+
+MAD-361. This script cannot produce the MAD-160 corpus, and pointing it at that config
+would silently produce a DIFFERENT corpus than the one the experiment specifies:
+
+  - It never reads mad160.yaml. SOURCE_WEIGHTS below is hardcoded for a different mix
+    (edgar, fiction, lyrics, github_code) -- and `edgar` is a source mad160.yaml
+    explicitly EXCLUDES.
+  - SEQ_LEN=2048 here; mad160.yaml says 4096. CORPUS_DIR=/mnt/mainpc; the config says
+    /mnt/hdd.
+  - There is no target_tokens cutoff. It runs until every source is exhausted.
+  - `random.choices` in weighted_interleave is UNSEEDED, so `shuffle_seed: 160` --
+    MAD-160's "identical stream across all 8 cells" control -- is not honoured.
+  - AND THE WEIGHTS DO NOT SET THE PROPORTIONS. weighted_interleave draws a source by
+    weight, yields ONE doc, and drops a source only once it is EXHAUSTED -- so the loop
+    runs until ALL sources are exhausted and EVERY document from EVERY source is emitted.
+    The final mix is just the natural file sizes; the weights only permute the interleave
+    ORDER. Demonstrated: intended {90%, 10%} came out {9%, 91%} -- inverted.
+
+The MAD-160 builder is mlambaformer/scripts/build_corpus.py, which reads the config,
+budgets each source in TOKENS, seeds its RNG, honours target_tokens, keeps the
+eval_holdout out of training, and writes a manifest of intended-vs-realized proportions.
+
+Left in place because it predates MAD-160 and may still serve the nemotron work it was
+written for.
+"""
+
 #!/usr/bin/env python3
 """Tokenize, deduplicate, and pack the pretraining corpus into fixed-length chunks.
 
