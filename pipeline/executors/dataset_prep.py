@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import random
+import shutil
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -77,7 +78,12 @@ class DatasetPrepExecutor(BaseExecutor):
         context_path = out_dir / "context.jsonl"
         calibration_path = out_dir / "calibration.jsonl"
 
+        # MAD-356: a real, declared holdout. Sources with purpose: "eval" land here and
+        # are NEVER carved out of the training set.
+        holdout_path = out_dir / "holdout.jsonl"
+
         training_f = open(training_path, "a")
+        eval_f = open(holdout_path, "a")
         context_f = open(context_path, "a")
         calibration_f = open(calibration_path, "a")
 
@@ -98,8 +104,29 @@ class DatasetPrepExecutor(BaseExecutor):
                     "source_type": source_cfg["type"],
                 }, stage_type="dataset_prep")
 
+                # MAD-356. There was no "eval" arm here, and the lookup ended in
+                # `.get(purpose, training_f)` -- so a source declaring purpose: "eval"
+                # was SILENTLY ROUTED INTO training.jsonl. The pipeline trained on its
+                # own holdout and said nothing.
+                #
+                # Two changes: "eval" now has a destination, and an unrecognised purpose
+                # now RAISES instead of defaulting into the training set. A silent
+                # default is exactly how the holdout got trained on -- a typo'd purpose
+                # must fail loudly, not quietly contaminate the experiment.
                 purpose = source_cfg.get("purpose", "training")
-                out_file = {"training": training_f, "context": context_f, "calibration": calibration_f}.get(purpose, training_f)
+                destinations = {
+                    "training": training_f,
+                    "eval": eval_f,
+                    "context": context_f,
+                    "calibration": calibration_f,
+                }
+                if purpose not in destinations:
+                    raise ValueError(
+                        f"source {source_name!r} declares unknown purpose {purpose!r}; "
+                        f"expected one of {sorted(destinations)}. Refusing to guess -- "
+                        f"the previous behaviour silently routed it into the training set."
+                    )
+                out_file = destinations[purpose]
 
                 count = 0
                 async for record in self._iter_source(source_cfg):
@@ -143,6 +170,7 @@ class DatasetPrepExecutor(BaseExecutor):
 
         finally:
             training_f.close()
+            eval_f.close()
             context_f.close()
             calibration_f.close()
             ddb.close()
@@ -150,8 +178,35 @@ class DatasetPrepExecutor(BaseExecutor):
         if self._force_pause or self._pause_requested:
             return None
 
-        # Split training.jsonl into train/eval
-        _split_train_eval(training_path, out_dir / "train.jsonl", out_dir / "eval.jsonl", train_split)
+        # MAD-356. Two fixes here.
+        #
+        # (1) If any source declared purpose: "eval", THAT is the holdout -- use it whole
+        #     and keep every training record in train.jsonl. Previously such a source was
+        #     silently merged into training and then a random 10% of the merged file was
+        #     called "eval", so the eval set was a slice OF TRAIN: in-distribution, and
+        #     contaminated by construction.
+        #
+        # (2) The fallback random split is now SEEDED. It used a bare random.shuffle(),
+        #     so the split was different on every run -- meaning the 8 MAD-160 cells were
+        #     not even being scored on the same eval set. The success criterion of the
+        #     whole experiment is a cross-cell eval comparison; it was not well-posed.
+        split_seed = int(self.config.get("shuffle_seed", self.config.get("seed", 160)))
+        if holdout_path.exists() and holdout_path.stat().st_size > 0:
+            shutil.copyfile(training_path, out_dir / "train.jsonl")
+            shutil.copyfile(holdout_path, out_dir / "eval.jsonl")
+            await self.emit_event("holdout", {
+                "source": "declared", "seed": None,
+            }, stage_type="dataset_prep")
+        else:
+            _split_train_eval(
+                training_path, out_dir / "train.jsonl", out_dir / "eval.jsonl",
+                train_split, seed=split_seed,
+            )
+            await self.emit_event("holdout", {
+                "source": "random_split_of_training", "seed": split_seed,
+                "warning": "eval is an in-distribution slice of train; declare a "
+                           "purpose:'eval' source for a true holdout",
+            }, stage_type="dataset_prep")
 
         # Fire-and-forget MotherDuck sync if token is available
         if os.getenv("MOTHERDUCK_TOKEN"):
@@ -1167,11 +1222,21 @@ async def _sync_motherduck_bg(base_dir: Path) -> None:
         pass  # sync failure never surfaces to the pipeline run
 
 
-def _split_train_eval(source: Path, train_out: Path, eval_out: Path, train_ratio: float) -> None:
+def _split_train_eval(
+    source: Path, train_out: Path, eval_out: Path, train_ratio: float, seed: int = 160
+) -> None:
+    """MAD-356: SEEDED. This used a bare `random.shuffle(lines)`, so the train/eval split
+    was different on every run -- the 8 MAD-160 cells were not being scored on the same
+    eval set, which makes the cross-cell comparison (the entire point of the experiment)
+    ill-posed. Use a local Random so we do not perturb global RNG state either.
+
+    Note this eval set is still an in-distribution slice of train. It is a fallback; a
+    real holdout means declaring a source with purpose: "eval".
+    """
     lines = source.read_text().splitlines()
     if not lines:
         return
-    random.shuffle(lines)
+    random.Random(seed).shuffle(lines)
     split_idx = int(len(lines) * train_ratio)
     train_out.write_text("\n".join(lines[:split_idx]) + "\n")
     eval_out.write_text("\n".join(lines[split_idx:]) + "\n")
