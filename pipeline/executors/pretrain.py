@@ -113,7 +113,26 @@ class PretrainExecutor(BaseExecutor):
             arch_path = cfg["architecture"]
             model_config = _load_architecture(arch_path, len(tokenizer))
             model = AutoModelForCausalLM.from_config(model_config)
-            model = model.to(dtype=torch.bfloat16 if bf16 else torch.float16)
+            # MAD-355 / MAD-374. DO NOT CAST THE MODEL. It used to do
+            #     model = model.to(dtype=torch.bfloat16 if bf16 else torch.float16)
+            # which makes the MASTER WEIGHTS bf16, and that is wrong twice over:
+            #
+            # 1. SILENT TRAINING STALL. bf16 has 8 mantissa bits, so an update smaller
+            #    than ~1/256 of a weight's magnitude rounds away to nothing. Measured on
+            #    this stack: at lr=1e-5 only 14.7% of weights changed per step; at 3e-6,
+            #    3.7%. Training quietly STOPS and the cosine tail reads as convergence.
+            # 2. IT BREAKS THE MAMBA MIMO KERNEL OUTRIGHT:
+            #    `kernel mamba_mimo_fwd_kernel input Q_BIAS dtype mismatch, expected
+            #    float32`. The hybrid could not train through this executor at all.
+            #
+            # The correct recipe is fp32 master weights + autocast, which is exactly what
+            # `bf16=True` in SFTConfig already does (HF wraps the forward in
+            # torch.autocast and keeps fp32 params). Passing bf16=True AND pre-casting the
+            # model gives you the autocast for free and throws away the master weights.
+            # Verified on the R9700 at the real 575M geometry: fp32 master + autocast
+            # trains, converges, and runs the MIMO kernel.
+            if bf16 or fp16:
+                _emit_sync("precision", {"master_weights": "fp32", "autocast": "bf16" if bf16 else "fp16"})
 
             param_count = sum(p.numel() for p in model.parameters())
             _emit_sync("corpus_loaded", {"param_count": param_count})
@@ -215,6 +234,30 @@ class PretrainExecutor(BaseExecutor):
                 gradient_checkpointing=bool(train_cfg.get("gradient_checkpointing", False)),
                 bf16=bf16,
                 fp16=fp16,
+                # MAD-377. AdamW's multi_tensor_apply was the single most expensive kernel
+                # in the step: 74.4 ms, 14.8% of GPU busy time. torch's default is the
+                # `foreach` path; `fused` does the update in one pass instead of staging
+                # through intermediates. Measured on the R9700 at the real geometry:
+                # 7,452 -> 8,177 tok/s (+9.7%), taking 48.8 of those 74.4 ms. It is also a
+                # FIXED per-step cost, so it hurts most at the small batches we are stuck
+                # with. (AITER has no optimizer kernel of any kind -- torch's or nothing.)
+                optim=train_cfg.get("optim", "adamw_torch_fused"),
+                # MAD-378. The step is ~93% NOT matmul -- ~21k unfused elementwise +
+                # ~3.9k reduce kernels of eager traffic, against 765 GEMMs. Inductor fuses
+                # them. Measured: 8,177 -> 11,246 tok/s (+37.5%) AND peak memory 14.76 ->
+                # 13.11 GiB, because fusion drops the intermediates.
+                #
+                # KNOWN INCOMPATIBILITY: this raises InductorError on the Mamba-3 SISO
+                # path (mamba_is_mimo=False) -- Inductor cannot trace those Triton
+                # kernels. MIMO and all-attention compile fine. Set torch_compile=false in
+                # the run config for any SISO cell.
+                torch_compile=bool(train_cfg.get("torch_compile", True)),
+                # MAD-366. The `shuffle_seed` in the corpus config was never wired to
+                # anything -- neither seed nor data_seed was ever set on either path, so
+                # the "identical stream across all 8 cells" control did not exist. Identical
+                # shard bytes are necessary but NOT sufficient; the sampler needs seeding too.
+                seed=int(train_cfg.get("seed", 160)),
+                data_seed=int(train_cfg.get("data_seed", train_cfg.get("seed", 160))),
                 eval_strategy="steps" if has_eval else "no",
                 eval_steps=int(train_cfg.get("eval_steps", 100)) if has_eval else None,
                 save_strategy="steps",
