@@ -70,6 +70,9 @@ def main() -> None:
     fp16 = bool(train_cfg.get("fp16", not bf16))
 
     # ── Tokenizer ──────────────────────────────────────────────────────────────
+    # MAD-327: MAD-160 runs set cfg["tokenizer_model"] to the pinned 48k slice,
+    # i.e. str(mlambaformer.tokenization.get_tokenizer_dir("mad160-48k")) -- the
+    # controlled-constant tokenizer shared across all 8 cells and the eval holdout.
     tokenizer_model = cfg.get("tokenizer_model")
     tokenizer_save = out_dir / "tokenizer"
 
@@ -100,6 +103,10 @@ def main() -> None:
     if model_type == "mlambaformer":
         import mlambaformer  # noqa: F401
     arch_dict.setdefault("vocab_size", len(tokenizer))
+
+    from pipeline.executors.pretrain import assert_vocab_matches
+    assert_vocab_matches(int(arch_dict["vocab_size"]), len(tokenizer))
+
     model_config = AutoConfig.for_model(model_type, **arch_dict)
     model = AutoModelForCausalLM.from_config(model_config)
 

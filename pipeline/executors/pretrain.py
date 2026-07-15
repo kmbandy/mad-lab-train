@@ -95,6 +95,9 @@ class PretrainExecutor(BaseExecutor):
             bf16, fp16 = _precision_flags(device, train_cfg)
 
             # ── Tokenizer ──────────────────────────────────────────────────────
+            # MAD-327: MAD-160 runs set cfg["tokenizer_model"] to the pinned 48k slice,
+            # i.e. str(mlambaformer.tokenization.get_tokenizer_dir("mad160-48k")) -- the
+            # controlled-constant tokenizer shared across all 8 cells and the eval holdout.
             tokenizer_model = cfg.get("tokenizer_model")
             vocab_size = int(cfg.get("vocab_size", 32000))
             run_datasets_dir = out_dir.parent
@@ -112,6 +115,7 @@ class PretrainExecutor(BaseExecutor):
             # ── Model from architecture ────────────────────────────────────────
             arch_path = cfg["architecture"]
             model_config = _load_architecture(arch_path, len(tokenizer))
+            assert_vocab_matches(int(model_config.vocab_size), len(tokenizer))
             model = AutoModelForCausalLM.from_config(model_config)
             # MAD-355 / MAD-374. DO NOT CAST THE MODEL. It used to do
             #     model = model.to(dtype=torch.bfloat16 if bf16 else torch.float16)
@@ -360,6 +364,15 @@ class PretrainExecutor(BaseExecutor):
 
 
 # ── Architecture / tokenizer helpers ──────────────────────────────────────────
+
+def assert_vocab_matches(arch_vocab_size: int, tokenizer_len: int) -> None:
+    """The model geometry and the tokenizer must agree. A silent mismatch builds the
+    wrong vocab_size (the class of the 261-token tokenizer bug)."""
+    if arch_vocab_size != tokenizer_len:
+        raise ValueError(
+            f"arch vocab_size={arch_vocab_size} != len(tokenizer)={tokenizer_len}; "
+            f"refusing to build a mismatched model.")
+
 
 def _load_architecture(arch_path: str, vocab_size: int):
     """Load a HuggingFace-compatible model config from a JSON/YAML architecture file."""
