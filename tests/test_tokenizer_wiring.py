@@ -17,4 +17,4 @@ def test_vocab_mismatch_raises():
 
 
 def test_vocab_match_ok():
-    assert_vocab_matches(arch_vocab_size=48000, tokenizer_len=48000) is None
+    assert assert_vocab_matches(arch_vocab_size=48000, tokenizer_len=48000) is None
