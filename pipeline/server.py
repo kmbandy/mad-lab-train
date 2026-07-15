@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+
 import uvicorn
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -5,7 +7,18 @@ from fastapi.middleware.cors import CORSMiddleware
 from pipeline.routers import datasets, hardware, runs, sse, templates
 from pipeline.settings import settings
 
-app = FastAPI(title="mad-lab-train pipeline server", version="2.0.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    from pipeline.scheduler import start_scheduler, stop_scheduler
+
+    await start_scheduler()
+    try:
+        yield
+    finally:
+        await stop_scheduler()
+
+app = FastAPI(title="mad-lab-train pipeline server", version="2.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,

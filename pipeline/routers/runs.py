@@ -70,9 +70,14 @@ async def create_run(body: RunCreate, db: AsyncSession = Depends(get_db)) -> dic
     stage_types = [s.stage_type for s in body.stages]
 
     priority = 100
-    if body.set_as_next:
+    if body.set_as_next or body.start_immediately:
         # Demote any existing priority-0 run to priority 1
-        result = await db.execute(select(Run).where(Run.priority == 0, Run.status == JobStatus.pending))
+        result = await db.execute(
+            select(Run).where(
+                Run.priority == 0,
+                Run.status.in_([JobStatus.pending, JobStatus.queued]),
+            )
+        )
         for existing in result.scalars().all():
             existing.priority = 1
         priority = 0
@@ -85,8 +90,8 @@ async def create_run(body: RunCreate, db: AsyncSession = Depends(get_db)) -> dic
         priority=priority,
         scheduled_for=body.scheduled_for,
         retain_logs_until=_compute_retain_until(stage_types),
-        status=JobStatus.running if body.start_immediately else JobStatus.pending,
-        started_at=datetime.now(timezone.utc) if body.start_immediately else None,
+        status=JobStatus.pending if body.scheduled_for else JobStatus.queued,
+        queued_at=None if body.scheduled_for else datetime.now(timezone.utc),
     )
     db.add(run)
     await db.flush()
@@ -100,6 +105,8 @@ async def create_run(body: RunCreate, db: AsyncSession = Depends(get_db)) -> dic
 
     await db.commit()
     await db.refresh(run)
+    from pipeline.scheduler import wake_scheduler
+    wake_scheduler()
     return {"run": RunResponse.model_validate(run)}
 
 
@@ -163,27 +170,29 @@ async def delete_run(run_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> N
 
 @router.post("/{run_id}/start")
 async def start_run(run_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
-    from pipeline.orchestrator import RunOrchestrator, get_orchestrator, register_orchestrator
+    from pipeline.orchestrator import get_orchestrator
+    from pipeline.scheduler import wake_scheduler
 
     run = await _get_run_or_404(run_id, db)
     if run.status not in (JobStatus.pending, JobStatus.queued):
         raise HTTPException(status_code=409, detail="Run is not in a startable state")
     if get_orchestrator(run_id):
         raise HTTPException(status_code=409, detail="Run already has an active orchestrator")
-
-    run.status = JobStatus.running
-    run.started_at = datetime.now(timezone.utc)
-    _add_event(run.id, "run_started", {}, db)
+    run.status = JobStatus.queued
+    run.scheduled_for = None
+    run.queued_at = run.queued_at or datetime.now(timezone.utc)
+    run.priority = 0
+    _add_event(run.id, "run_queued", {"source": "manual"}, db)
     await db.commit()
-
-    orch = RunOrchestrator(run_id)
-    register_orchestrator(run_id, orch)
-    orch.launch()
+    wake_scheduler()
     return {"status": run.status}
 
 
 @router.post("/{run_id}/cancel")
 async def cancel_run(run_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> dict:
+    from pipeline.orchestrator import get_orchestrator
+    from pipeline.scheduler import wake_scheduler
+
     run = await _get_run_or_404(run_id, db)
     if run.status in (JobStatus.completed, JobStatus.failed, JobStatus.cancelled):
         raise HTTPException(status_code=409, detail="Run is already in a terminal state")
@@ -191,6 +200,10 @@ async def cancel_run(run_id: uuid.UUID, db: AsyncSession = Depends(get_db)) -> d
     run.ended_at = datetime.now(timezone.utc)
     _add_event(run.id, "run_cancelled", {}, db)
     await db.commit()
+    orch = get_orchestrator(run_id)
+    if orch:
+        await orch.cancel()
+    wake_scheduler()
     return {"status": run.status}
 
 
@@ -228,7 +241,8 @@ async def force_pause_run(run_id: uuid.UUID, db: AsyncSession = Depends(get_db))
 
 @router.post("/{run_id}/resume")
 async def resume_run(run_id: uuid.UUID, body: ResumeRequest, db: AsyncSession = Depends(get_db)) -> dict:
-    from pipeline.orchestrator import RunOrchestrator, get_orchestrator, register_orchestrator
+    from pipeline.orchestrator import get_orchestrator
+    from pipeline.scheduler import wake_scheduler
 
     run = await _get_run_or_404(run_id, db)
     if run.status != JobStatus.paused:
@@ -236,14 +250,43 @@ async def resume_run(run_id: uuid.UUID, body: ResumeRequest, db: AsyncSession = 
     if get_orchestrator(run_id):
         raise HTTPException(status_code=409, detail="Run already has an active orchestrator")
 
-    run.status = JobStatus.running
-    checkpoint_id = str(body.checkpoint_id) if body.checkpoint_id else "latest_clean"
+    checkpoint = None
+    if body.checkpoint_id:
+        checkpoint = await db.get(Checkpoint, body.checkpoint_id)
+        if checkpoint is None or checkpoint.run_id != run_id:
+            raise HTTPException(status_code=404, detail="Checkpoint not found for this run")
+    else:
+        result = await db.execute(
+            select(Checkpoint)
+            .where(Checkpoint.run_id == run_id, Checkpoint.is_clean.is_(True))
+            .order_by(Checkpoint.created_at.desc())
+            .limit(1)
+        )
+        checkpoint = result.scalar_one_or_none()
+
+    if checkpoint:
+        checkpoint_stage = await db.get(Stage, checkpoint.stage_id)
+        result = await db.execute(
+            select(Stage).where(
+                Stage.run_id == run_id,
+                Stage.sequence >= checkpoint_stage.sequence,
+            )
+        )
+        for stage in result.scalars().all():
+            stage.status = StageStatus.paused if stage.id == checkpoint.stage_id else StageStatus.pending
+            stage.started_at = None
+            stage.ended_at = None
+            stage.error = None
+            stage.output_path = None
+
+    run.status = JobStatus.queued
+    run.priority = 0
+    run.queued_at = datetime.now(timezone.utc)
+    checkpoint_id = str(checkpoint.id) if checkpoint else None
     _add_event(run.id, "run_resumed", {"checkpoint_id": checkpoint_id}, db)
     await db.commit()
 
-    orch = RunOrchestrator(run_id)
-    register_orchestrator(run_id, orch)
-    orch.launch()
+    wake_scheduler()
     return {"status": run.status}
 
 
@@ -268,9 +311,15 @@ async def set_priority(run_id: uuid.UUID, body: PriorityUpdate, db: AsyncSession
 
 @router.post("/{run_id}/schedule")
 async def schedule_run(run_id: uuid.UUID, body: ScheduleUpdate, db: AsyncSession = Depends(get_db)) -> dict:
+    from pipeline.scheduler import wake_scheduler
+
     run = await _get_run_or_404(run_id, db)
+    if run.status not in (JobStatus.pending, JobStatus.queued):
+        raise HTTPException(status_code=409, detail="Can only schedule pending or queued runs")
     run.scheduled_for = body.scheduled_for
+    run.status = JobStatus.pending if body.scheduled_for else JobStatus.queued
     await db.commit()
+    wake_scheduler()
     return {"scheduled_for": run.scheduled_for}
 
 

@@ -60,3 +60,43 @@ class BaseExecutor(ABC):
             )
             db.add(event)
             await db.commit()
+
+    async def record_checkpoint(
+        self,
+        sequence: int,
+        artifact_path: str,
+        metadata: dict,
+        *,
+        is_clean: bool = True,
+    ) -> None:
+        """Insert or refresh a durable checkpoint boundary for this stage."""
+        from sqlalchemy import select
+        from datetime import datetime, timezone
+
+        from pipeline.db import AsyncSessionLocal
+        from pipeline.models import Checkpoint
+
+        async with AsyncSessionLocal() as db:
+            result = await db.execute(
+                select(Checkpoint).where(
+                    Checkpoint.stage_id == self.stage_id,
+                    Checkpoint.sequence == sequence,
+                )
+            )
+            checkpoint = result.scalar_one_or_none()
+            if checkpoint is None:
+                checkpoint = Checkpoint(
+                    run_id=self.run_id,
+                    stage_id=self.stage_id,
+                    sequence=sequence,
+                    is_clean=is_clean,
+                    artifact_path=artifact_path,
+                    meta=metadata,
+                )
+                db.add(checkpoint)
+            else:
+                checkpoint.is_clean = is_clean
+                checkpoint.artifact_path = artifact_path
+                checkpoint.meta = metadata
+                checkpoint.created_at = datetime.now(timezone.utc)
+            await db.commit()

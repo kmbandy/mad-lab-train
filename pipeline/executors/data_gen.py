@@ -65,8 +65,11 @@ class DataGenExecutor(BaseExecutor):
         topics = cfg.get("topics") or []
 
         # Load checkpoint
-        checkpoint = _load_checkpoint(out_dir)
+        checkpoint = _load_checkpoint(out_dir, cfg.get("_resume_artifact"))
         samples_done = checkpoint.get("samples_done", 0)
+        if cfg.get("_resume_artifact") and output_path.exists() and "output_bytes" in checkpoint:
+            with open(output_path, "r+b") as output_file:
+                output_file.truncate(int(checkpoint["output_bytes"]))
 
         # Load context pool from upstream dataset_prep output
         context_pool = _load_context_pool(out_dir.parent)
@@ -138,7 +141,16 @@ class DataGenExecutor(BaseExecutor):
                         }, stage_type="data_gen")
 
                         if samples_done % 100 == 0:
-                            _save_checkpoint(out_dir, samples_done)
+                            checkpoint_path = _save_checkpoint(
+                                out_dir,
+                                samples_done,
+                                output_path.stat().st_size,
+                            )
+                            await self.record_checkpoint(
+                                samples_done,
+                                str(checkpoint_path),
+                                {"samples_completed": samples_done, "total_samples": samples_target},
+                            )
 
                 tasks = [asyncio.create_task(run_slot(i)) for i in range(remaining)]
                 await asyncio.gather(*tasks)
@@ -399,8 +411,8 @@ def _sample_context(pool: list[str], topics: list[str], slot_idx: int) -> str:
     return ""
 
 
-def _load_checkpoint(out_dir: Path) -> dict:
-    cp = out_dir / ".checkpoint.json"
+def _load_checkpoint(out_dir: Path, resume_artifact: str | None = None) -> dict:
+    cp = Path(resume_artifact) if resume_artifact else out_dir / ".checkpoint.json"
     if cp.exists():
         try:
             return json.loads(cp.read_text())
@@ -951,7 +963,12 @@ def _build_trace_record_from_failure(
     }
 
 
-def _save_checkpoint(out_dir: Path, samples_done: int, key: str = "samples_done") -> None:
+def _save_checkpoint(
+    out_dir: Path,
+    samples_done: int,
+    output_bytes: int = 0,
+    key: str = "samples_done",
+) -> Path:
     """Persist a counter into the shared checkpoint file under the given key.
 
     Default key matches the legacy `generate` mode behavior. `trace_farm` uses
@@ -965,4 +982,11 @@ def _save_checkpoint(out_dir: Path, samples_done: int, key: str = "samples_done"
         except Exception:
             existing = {}
     existing[key] = samples_done
-    cp.write_text(json.dumps(existing))
+    if key == "samples_done":
+        existing["output_bytes"] = output_bytes
+    data = json.dumps(existing)
+    cp.write_text(data)
+    snapshot = out_dir / "checkpoints" / f"{key}-{samples_done}.json"
+    snapshot.parent.mkdir(parents=True, exist_ok=True)
+    snapshot.write_text(data)
+    return snapshot

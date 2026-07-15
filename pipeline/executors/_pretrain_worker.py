@@ -238,7 +238,7 @@ def main() -> None:
         )
 
     from pipeline.executors.finetune import _find_latest_checkpoint
-    resume_from = _find_latest_checkpoint(out_dir)
+    resume_from = cfg.get("_resume_artifact") or _find_latest_checkpoint(out_dir)
     trainer.train(resume_from_checkpoint=resume_from)
 
     if is_main:

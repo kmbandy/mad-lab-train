@@ -42,7 +42,7 @@ class QuantExecutor(BaseExecutor):
         output_prefix = cfg.get("output_prefix") or str(self.run_id)[:8]
 
         # Load checkpoint — track completed quant types
-        checkpoint = _load_checkpoint(out_dir)
+        checkpoint = _load_checkpoint(out_dir, cfg.get("_resume_artifact"))
         completed_types: set[str] = set(checkpoint.get("completed_types", []))
         f16_path_saved: str | None = checkpoint.get("f16_path")
         imatrix_path_saved: str | None = checkpoint.get("imatrix_path")
@@ -114,7 +114,15 @@ class QuantExecutor(BaseExecutor):
 
             completed_types.add(qtype)
             checkpoint["completed_types"] = list(completed_types)
-            _save_checkpoint(out_dir, checkpoint)
+            checkpoint_path = _save_checkpoint(out_dir, checkpoint, len(completed_types))
+            await self.record_checkpoint(
+                len(completed_types),
+                str(checkpoint_path),
+                {
+                    "quant_types_completed": sorted(completed_types),
+                    "current_quant_type": qtype,
+                },
+            )
             output_paths.append(str(out_path))
 
         if self._force_pause or self._pause_requested:
@@ -264,8 +272,8 @@ def _extract_text_from_jsonl(jsonl_path: Path, text_path: Path) -> None:
                 pass
 
 
-def _load_checkpoint(out_dir: Path) -> dict:
-    cp = out_dir / ".checkpoint.json"
+def _load_checkpoint(out_dir: Path, resume_artifact: str | None = None) -> dict:
+    cp = Path(resume_artifact) if resume_artifact else out_dir / ".checkpoint.json"
     if cp.exists():
         try:
             return json.loads(cp.read_text())
@@ -274,5 +282,11 @@ def _load_checkpoint(out_dir: Path) -> dict:
     return {}
 
 
-def _save_checkpoint(out_dir: Path, data: dict) -> None:
+def _save_checkpoint(out_dir: Path, data: dict, sequence: int | None = None) -> Path:
     (out_dir / ".checkpoint.json").write_text(json.dumps(data))
+    if sequence is None:
+        return out_dir / ".checkpoint.json"
+    snapshot = out_dir / "checkpoints" / f"checkpoint-{sequence}.json"
+    snapshot.parent.mkdir(parents=True, exist_ok=True)
+    snapshot.write_text(json.dumps(data))
+    return snapshot

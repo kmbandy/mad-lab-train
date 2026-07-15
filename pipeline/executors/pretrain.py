@@ -216,6 +216,14 @@ class PretrainExecutor(BaseExecutor):
                         "sequence": state.global_step,
                         "metadata": {"epoch": state.epoch, "step": state.global_step},
                     })
+                    asyncio.run_coroutine_threadsafe(
+                        executor_ref.record_checkpoint(
+                            state.global_step,
+                            str(out_dir / f"checkpoint-{state.global_step}"),
+                            {"epoch": state.epoch, "step": state.global_step},
+                        ),
+                        loop,
+                    )
                     if executor_ref._pause_requested:
                         control.should_training_stop = True
 
@@ -291,7 +299,7 @@ class PretrainExecutor(BaseExecutor):
                 )
 
             from pipeline.executors.finetune import _find_latest_checkpoint
-            resume_from = _find_latest_checkpoint(out_dir)
+            resume_from = cfg.get("_resume_artifact") or _find_latest_checkpoint(out_dir)
             trainer.train(resume_from_checkpoint=resume_from)
             trainer.save_model(str(out_dir))
 
@@ -345,6 +353,14 @@ class PretrainExecutor(BaseExecutor):
                     await self.emit_event(
                         evt["event"], evt.get("data", {}), stage_type="pretrain"
                     )
+                    if evt["event"] == "checkpoint":
+                        data = evt.get("data", {})
+                        sequence = int(data.get("sequence", 0))
+                        await self.record_checkpoint(
+                            sequence,
+                            str(out_dir / f"checkpoint-{sequence}"),
+                            data.get("metadata", {}),
+                        )
                 except Exception:
                     pass
 

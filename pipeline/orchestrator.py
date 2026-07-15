@@ -39,6 +39,7 @@ class RunOrchestrator:
         self.run_id = run_id
         self._current_executor: BaseExecutor | None = None
         self._task: asyncio.Task | None = None
+        self._cancel_requested = False
 
     def launch(self) -> None:
         """Create an asyncio background task to run all stages."""
@@ -49,6 +50,17 @@ class RunOrchestrator:
             await self._current_executor.pause()
 
     async def force_pause(self) -> None:
+        if self._current_executor:
+            await self._current_executor.force_pause()
+
+    async def cancel(self) -> None:
+        """Request termination without cancelling the asyncio task itself.
+
+        Some executors run blocking ML work in a thread. Cancelling the wrapper
+        task would orphan that work, so cancellation is propagated through the
+        executor's force-pause hook and observed at the next lifecycle boundary.
+        """
+        self._cancel_requested = True
         if self._current_executor:
             await self._current_executor.force_pause()
 
@@ -71,17 +83,29 @@ class RunOrchestrator:
                     .order_by(Stage.sequence.asc())
                 )
                 stages = result.scalars().all()
+                resume_checkpoint = await _load_resume_checkpoint(db, self.run_id)
+                previous_stage = None
 
                 for stage in stages:
+                    if self._cancel_requested or await _run_is_cancelled(db, self.run_id):
+                        return
                     if stage.status == StageStatus.completed:
+                        previous_stage = stage
                         continue
+
+                    if previous_stage and previous_stage.output_path:
+                        stage.input_path = previous_stage.output_path
 
                     # Mark stage running
                     stage.status = StageStatus.running
                     stage.started_at = datetime.now(timezone.utc)
                     await db.commit()
 
-                    cfg_data = stage.config.config if stage.config else {}
+                    cfg_data = dict(stage.config.config) if stage.config else {}
+                    _wire_upstream_artifact(stage, previous_stage, cfg_data)
+                    if resume_checkpoint and resume_checkpoint.stage_id == stage.id:
+                        cfg_data["_resume_artifact"] = resume_checkpoint.artifact_path
+                        cfg_data["_resume_metadata"] = resume_checkpoint.meta
 
                     if use_ec2:
                         from pipeline.executors.ec2 import Ec2Executor
@@ -101,6 +125,14 @@ class RunOrchestrator:
                         stage_error = str(exc)
 
                     self._current_executor = None
+
+                    if self._cancel_requested or await _run_is_cancelled(db, self.run_id):
+                        if stage.status == StageStatus.running:
+                            stage.status = StageStatus.failed
+                            stage.error = "Cancelled"
+                            stage.ended_at = datetime.now(timezone.utc)
+                            await db.commit()
+                        return
 
                     # Determine outcome
                     was_paused = (
@@ -127,6 +159,7 @@ class RunOrchestrator:
                     stage.output_path = output_path
                     stage.ended_at = datetime.now(timezone.utc)
                     await db.commit()
+                    previous_stage = stage
 
                 await _finish_run(db, self.run_id, JobStatus.completed)
 
@@ -149,11 +182,42 @@ async def _finish_run(
 
     run = await db.get(Run, run_id)
     if run:
+        if run.status == JobStatus.cancelled and status != JobStatus.cancelled:
+            return
         run.status = status
         run.ended_at = datetime.now(timezone.utc)
         if error:
             run.error = error
         await db.commit()
+
+
+async def _run_is_cancelled(db, run_id: uuid.UUID) -> bool:
+    from pipeline.models import JobStatus, Run
+
+    run = await db.get(Run, run_id, populate_existing=True)
+    return bool(run and run.status == JobStatus.cancelled)
+
+
+async def _load_resume_checkpoint(db, run_id: uuid.UUID):
+    """Resolve the checkpoint selected by the most recent resume request."""
+    from sqlalchemy import select
+
+    from pipeline.models import Checkpoint, Event
+
+    result = await db.execute(
+        select(Event)
+        .where(Event.run_id == run_id, Event.event_type == "run_resumed")
+        .order_by(Event.id.desc())
+        .limit(1)
+    )
+    event = result.scalar_one_or_none()
+    checkpoint_id = (event.data or {}).get("checkpoint_id") if event else None
+    if not checkpoint_id:
+        return None
+    try:
+        return await db.get(Checkpoint, uuid.UUID(checkpoint_id))
+    except (TypeError, ValueError):
+        return None
 
 
 def _make_executor(
@@ -193,3 +257,38 @@ def _make_executor(
     if cls is None:
         raise ValueError(f"Unknown stage type: {stage_type}")
     return cls(run_id, stage_id, config, db)
+
+
+def _wire_upstream_artifact(stage, previous_stage, config: dict) -> None:
+    """Inject the preceding artifact using the executor's established key."""
+    if previous_stage is None or not previous_stage.output_path:
+        return
+
+    from pipeline.models import StageType
+
+    output_path = previous_stage.output_path
+    key_by_type = {
+        StageType.moeify: "base_model",
+        StageType.quant: "model_path",
+        StageType.prune: "model_path",
+        StageType.eval: "model_path",
+        StageType.convert: "input_path",
+        StageType.upload: "source_path",
+    }
+    key = key_by_type.get(stage.stage_type)
+    if key:
+        config.setdefault(key, output_path)
+
+    if stage.stage_type == StageType.finetune and previous_stage.stage_type in {
+        StageType.pretrain,
+        StageType.moeify,
+        StageType.merge,
+        StageType.prune,
+    }:
+        config.setdefault("base_model", output_path)
+
+    if stage.stage_type == StageType.merge and config.get("mode", "adapter") == "adapter":
+        config.setdefault("adapter_path", output_path)
+        previous_config = previous_stage.config.config if previous_stage.config else {}
+        if previous_stage.stage_type == StageType.finetune and previous_config.get("base_model"):
+            config.setdefault("base_model", previous_config["base_model"])

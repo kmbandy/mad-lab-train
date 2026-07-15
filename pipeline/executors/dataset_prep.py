@@ -70,7 +70,7 @@ class DatasetPrepExecutor(BaseExecutor):
             pass
 
         # Load checkpoint to resume from
-        checkpoint = self._load_checkpoint(out_dir)
+        checkpoint = self._load_checkpoint(out_dir, self.config.get("_resume_artifact"))
         completed_sources = set(checkpoint.get("completed_sources", []))
         seen_hashes: set[str] = set(checkpoint.get("seen_hashes", []))
 
@@ -166,7 +166,16 @@ class DatasetPrepExecutor(BaseExecutor):
 
                 if not self._force_pause and not self._pause_requested:
                     completed_sources.add(source_name)
-                    self._save_checkpoint(out_dir, completed_sources, seen_hashes)
+                    checkpoint_path = self._save_checkpoint(out_dir, completed_sources, seen_hashes)
+                    await self.record_checkpoint(
+                        len(completed_sources),
+                        str(checkpoint_path),
+                        {
+                            "sources_completed": len(completed_sources),
+                            "total_sources": len(sources),
+                            "records_written": len(seen_hashes),
+                        },
+                    )
 
         finally:
             training_f.close()
@@ -243,8 +252,8 @@ class DatasetPrepExecutor(BaseExecutor):
             async for r in _iter_claude_jsonl(cfg, max_records):
                 yield r
 
-    def _load_checkpoint(self, out_dir: Path) -> dict:
-        cp = out_dir / ".checkpoint.json"
+    def _load_checkpoint(self, out_dir: Path, resume_artifact: str | None = None) -> dict:
+        cp = Path(resume_artifact) if resume_artifact else out_dir / ".checkpoint.json"
         if cp.exists():
             try:
                 return json.loads(cp.read_text())
@@ -252,12 +261,17 @@ class DatasetPrepExecutor(BaseExecutor):
                 pass
         return {}
 
-    def _save_checkpoint(self, out_dir: Path, completed: set, seen: set) -> None:
+    def _save_checkpoint(self, out_dir: Path, completed: set, seen: set) -> Path:
         cp = out_dir / ".checkpoint.json"
-        cp.write_text(json.dumps({
+        data = json.dumps({
             "completed_sources": list(completed),
             "seen_hashes": list(seen),
-        }))
+        })
+        cp.write_text(data)
+        snapshot = out_dir / "checkpoints" / f"checkpoint-{len(completed)}.json"
+        snapshot.parent.mkdir(parents=True, exist_ok=True)
+        snapshot.write_text(data)
+        return snapshot
 
 
 # ── Source iterators ─────────────────────────────────────────────

@@ -158,6 +158,14 @@ class FinetuneExecutor(BaseExecutor):
                             "step": state.global_step,
                         },
                     })
+                    asyncio.run_coroutine_threadsafe(
+                        executor_ref.record_checkpoint(
+                            state.global_step,
+                            str(out_dir / f"checkpoint-{state.global_step}"),
+                            {"epoch": state.epoch, "step": state.global_step},
+                        ),
+                        loop,
+                    )
                     if executor_ref._pause_requested:
                         control.should_training_stop = True
 
@@ -265,7 +273,7 @@ class FinetuneExecutor(BaseExecutor):
                 callbacks=[_PipelineCallback()],
             )
 
-            resume_from = _find_latest_checkpoint(out_dir)
+            resume_from = cfg.get("_resume_artifact") or _find_latest_checkpoint(out_dir)
             trainer.train(resume_from_checkpoint=resume_from)
             trainer.save_model(str(out_dir))
 
