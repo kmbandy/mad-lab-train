@@ -22,6 +22,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from pipeline.executors.base import BaseExecutor
 
 
+def bits_per_byte(total_loss_nats: float, total_tokens: int, total_bytes: int) -> float:
+    """Tokenizer-independent compression metric. total_loss_nats is the SUM of
+    per-token cross-entropy in nats over the eval set; total_bytes is the UTF-8 byte
+    length of the scored text. Comparable across vocab sizes (unlike per-token PPL)."""
+    if total_bytes <= 0:
+        return 0.0
+    return (total_loss_nats / math.log(2)) / total_bytes
+
+
 class EvalExecutor(BaseExecutor):
     def __init__(self, run_id: uuid.UUID, stage_id: uuid.UUID, config: dict, db: AsyncSession):
         super().__init__(run_id, stage_id, config, db)
@@ -168,6 +177,9 @@ def _bench_perplexity(
 
     total_loss = 0.0
     count = 0
+    total_loss_nats = 0.0   # MAD-327: summed CE (nats) for bits-per-byte
+    total_bytes = 0         # UTF-8 bytes of the scored (post-truncation) text
+    total_scored = 0        # scored token positions (causal shift)
 
     with open(dataset_path) as f:
         for line in f:
@@ -187,6 +199,13 @@ def _bench_perplexity(
                 total_loss += float(out.loss)
                 count += 1
 
+                n_tok = int(ids["input_ids"].shape[1])
+                n_scored = max(n_tok - 1, 1)   # causal LM shifts labels by one
+                total_loss_nats += float(out.loss) * n_scored
+                total_scored += n_scored
+                scored_text = tokenizer.decode(ids["input_ids"][0], skip_special_tokens=True)
+                total_bytes += len(scored_text.encode("utf-8"))
+
                 if count % 20 == 0:
                     emit_sync("sample_evaluated", {
                         "count": count,
@@ -197,6 +216,12 @@ def _bench_perplexity(
 
     if count == 0:
         return 0.0
+
+    emit_sync("bits_per_byte", {
+        "value": bits_per_byte(total_loss_nats, total_scored, total_bytes),
+        "total_bytes": total_bytes,
+        "total_scored_tokens": total_scored,
+    })
 
     avg_loss = total_loss / count
     try:
