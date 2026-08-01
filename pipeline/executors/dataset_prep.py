@@ -439,7 +439,7 @@ async def _iter_claude_jsonl(cfg: dict, max_records: int | None):
     agent = cfg.get("agent", "claude-code")
     base_trace_source = cfg.get("trace_source", "organic_work")
     reconstruct = bool(cfg.get("reconstruct_injections", False))
-    kg_url = cfg.get("kg_url", "http://100.102.191.30:18830/context")
+    kg_url = cfg.get("kg_url", "http://mad-lab-2026.tail322e50.ts.net:18830/context")
     kg_timeout = float(cfg.get("kg_timeout_s", 3.0))
     annotate_spans = bool(cfg.get("annotate_spans", False))
     span_min_match = int(cfg.get("span_min_match", 30))

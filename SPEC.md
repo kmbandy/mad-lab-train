@@ -889,7 +889,7 @@ Mines Claude Code (or compatible agent) JSONL session transcripts into MAD-162-s
 | `agent` | `string` | `claude-code` | no (provenance tag) |
 | `trace_source` | `organic_work \| organic_work_with_replay_injection \| programmatic_task \| benchmark \| seeded_synthetic \| captured_hook_injection` | `organic_work` | no |
 | `reconstruct_injections` | `bool` | `false` | no — when `true`, each turn is enriched by querying the personal-KG `/context` endpoint with the user prompt (mirroring the runtime hook) and attaching the result as a synthetic `personal-kg-context-replay` memory_call. Trace_source auto-promotes to `organic_work_with_replay_injection`. |
-| `kg_url` | `string` | `http://100.102.191.30:18830/context` | no (reconstruct_injections only) |
+| `kg_url` | `string` | `http://mad-lab-2026.tail322e50.ts.net:18830/context` | no (reconstruct_injections only) |
 | `kg_timeout_s` | `float` | `3.0` | no (reconstruct_injections only) |
 | `annotate_spans` | `bool` | `false` | no — when `true`, applies span-annotation tiers (verbatim → paraphrase → reasoning) to the assistant output. Span lists populated on the record's `trace`. |
 | `span_min_match` | `int` | `30` | no (tier-1) — minimum char length for a verbatim retrieved span. |
