@@ -37,6 +37,68 @@ def _deepspeed_config(zero_stage: int, bf16: bool, fp16: bool) -> dict:
     }
 
 
+def _pack_with_domains(raw_ds, tokenizer, seq_len: int):
+    """Pack {"text", "domain_id"} records into fixed-length input_ids + domain_ids.
+
+    Module-level and dependency-light on purpose: this is the piece that decides which
+    token gets supervised as which domain, and if it is wrong nothing downstream can
+    tell -- the loss curve stays perfectly plausible while the gate trains toward a
+    mislabelled target. It needs to be unit-testable without a GPU, a trainer, or a real
+    tokenizer, so the packing itself lives in mlambaformer.packing (which takes a plain
+    encode callable) and this function only adapts a HF dataset to it.
+    """
+    from datasets import Dataset
+
+    from mlambaformer.packing import pack_domain_documents
+
+    cols = set(raw_ds.column_names)
+    missing = {"text", "domain_id"} - cols
+    if missing:
+        raise ValueError(
+            f"data_format='text_domains' needs columns {sorted(missing)} which are absent "
+            f"from the dataset (has: {sorted(cols)}). build_corpus.py writes both; a "
+            "corpus built before the domain enum, or a JSONL produced by another path, "
+            "will not have domain_id. Refusing rather than training an unsupervised gate "
+            "while the config claims supervision."
+        )
+
+    def _encode(text: str) -> list[int]:
+        return tokenizer(text, add_special_tokens=False)["input_ids"]
+
+    eos_id = tokenizer.eos_token_id
+    if eos_id is None:
+        raise ValueError("tokenizer has no eos_token_id; cannot separate packed documents")
+
+    # Dataset.from_generator MATERIALISES an Arrow cache. It is fine for smoke runs and
+    # tests and catastrophic for the real corpus: 50B tokens becomes int64 input_ids
+    # 0.40 TB + labels 0.40 TB + domain_ids 0.40 TB = 1.2 TB, against 407 GB free on
+    # /home and 493 GB on /mnt/hdd. Fail with the arithmetic rather than filling the disk
+    # partway through a multi-hour tokenisation.
+    _MAX_INLINE_DOCS = 500_000
+    if len(raw_ds) > _MAX_INLINE_DOCS:
+        raise ValueError(
+            f"{len(raw_ds):,} documents is too many to pack inline: Dataset.from_generator "
+            "writes an int64 Arrow cache (~24 bytes/token across input_ids, labels and "
+            "domain_ids) and will exhaust the disk. Pre-pack instead with "
+            "mlambaformer/scripts/pack_corpus.py (uint16 tokens + int8 domains, ~3 "
+            "bytes/token) and set `shards_dir` in the run config."
+        )
+
+    def _gen():
+        docs = ((r["text"], int(r["domain_id"])) for r in raw_ds)
+        for win in pack_domain_documents(docs, _encode, seq_len, eos_id=eos_id):
+            # labels == input_ids: the model shifts internally for CLM. domain_ids is
+            # NOT shifted -- domain is a property of the token at position s and the gate
+            # reads position s's hidden state (modeling_mlambaformer.py:643-645).
+            yield {
+                "input_ids": win["input_ids"],
+                "labels": list(win["input_ids"]),
+                "domain_ids": win["domain_ids"],
+            }
+
+    return Dataset.from_generator(_gen)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
@@ -46,7 +108,7 @@ def main() -> None:
         cfg = json.load(f)
 
     import torch
-    from datasets import load_dataset
+    from datasets import Dataset, load_dataset
     from transformers import (
         AutoConfig,
         AutoModelForCausalLM,
@@ -56,6 +118,7 @@ def main() -> None:
         TrainerControl,
         TrainerState,
         TrainingArguments,
+        default_data_collator,
     )
     from trl import SFTConfig, SFTTrainer
 
@@ -195,6 +258,21 @@ def main() -> None:
     ds_config = _deepspeed_config(zero_stage, bf16, fp16)
 
     data_format = cfg.get("data_format", "messages")
+    # D2 guard, at the pipeline end rather than only in the model. A config that asks to
+    # supervise the domain gate but selects a data_format carrying no labels would train
+    # a frozen gate for the whole run. The model raises on the first step, but catching
+    # it here means the failure lands before the GPU is claimed and the checkpoint
+    # directory is created, and it names the actual fix.
+    _coef = float(getattr(model.config, "moe_domain_gate_loss_coef", 0.0) or 0.0)
+    if _coef > 0.0 and data_format != "text_domains":
+        raise ValueError(
+            f"model config sets moe_domain_gate_loss_coef={_coef} but data_format="
+            f"{data_format!r} supplies no per-token domain labels, so the domain-gate "
+            "cross-entropy could never fire and the gate would stay a fixed random "
+            "projection for the entire run. Use data_format: 'text_domains' (needs a "
+            "corpus with a domain_id column), or set moe_domain_gate_loss_coef to 0.0 to "
+            "declare an unsupervised gate deliberately."
+        )
     common = dict(
         output_dir=str(out_dir),
         num_train_epochs=int(train_cfg.get("epochs", 3)),
@@ -219,7 +297,56 @@ def main() -> None:
     )
     from pipeline.executors._quant_native_callbacks import mlambaformer_quant_callbacks
     quant_cbs = mlambaformer_quant_callbacks(model)
-    if data_format == "text":
+    if data_format == "text_domains":
+        # MAD-322 / D2: raw-text CLM pretraining that ALSO supervises the domain gate.
+        #
+        # We pack here rather than letting TRL do it. TRL's packing=True concatenates
+        # documents and keeps only the text column, so a per-DOCUMENT domain_id cannot
+        # reach the model as per-TOKEN supervision -- and a packed sequence spans several
+        # documents with different domains, so the label genuinely has to be built while
+        # packing. Without this the domain gate receives no gradient at all and stays a
+        # fixed random projection for the whole run (the D2 defect).
+        #
+        # MAD-364: domain_ids is a SEPARATE tensor and never enters input_ids. An
+        # in-stream domain tag was deliberately cut because under causal attention every
+        # token attends to a tag at position 0 and Mamba's state carries it forward, so
+        # the gate would learn a trivial lookup and collapse at inference.
+        seq_len = int(cfg.get("max_seq_length", 2048))
+        shards_dir = cfg.get("shards_dir")
+        if shards_dir:
+            # PRODUCTION PATH. Pre-packed memmapped shards: uint16 tokens + int8 domain
+            # ids in a parallel file. At 50B tokens this is 0.15 TB; routing the same
+            # corpus through Dataset.from_generator would write an Arrow cache of int64
+            # columns totalling 1.2 TB, against 407 GB free. Pack with
+            # mlambaformer/scripts/pack_corpus.py.
+            from mlambaformer.data import MlambaformerDataset
+
+            train_ds = MlambaformerDataset(shards_dir, seq_len, require_domains=True)
+            eval_shards = cfg.get("eval_shards_dir")
+            eval_ds = (
+                MlambaformerDataset(eval_shards, seq_len, require_domains=True)
+                if eval_shards else None
+            )
+        else:
+            train_ds = _pack_with_domains(train_ds, tokenizer, seq_len)
+            eval_ds = _pack_with_domains(eval_ds, tokenizer, seq_len) if eval_ds else None
+        sft_config = SFTConfig(
+            **common, dataset_text_field=None, packing=False,
+            # domain_ids IS in MlambaformerForCausalLM.forward's signature, so HF would
+            # normally keep it -- but SFTTrainer does its own column handling and a
+            # dropped label here fails SILENTLY (the model raises only if coef > 0, and
+            # the CE is simply skipped otherwise). Being explicit is cheaper than
+            # discovering it from a flat gate 40 GPU-hours in.
+            remove_unused_columns=False,
+        )
+        trainer = SFTTrainer(
+            model=model, args=sft_config,
+            train_dataset=train_ds, eval_dataset=eval_ds,
+            processing_class=tokenizer,
+            data_collator=default_data_collator,
+            callbacks=[_WorkerCallback(), *quant_cbs],
+        )
+    elif data_format == "text":
         # raw-text CLM pretraining: pack the `text` field, no chat template
         sft_config = SFTConfig(**common, dataset_text_field="text", packing=True)
         trainer = SFTTrainer(
