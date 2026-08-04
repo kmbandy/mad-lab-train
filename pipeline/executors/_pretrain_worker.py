@@ -37,18 +37,21 @@ def _deepspeed_config(zero_stage: int, bf16: bool, fp16: bool) -> dict:
     }
 
 
-def _pack_with_domains(raw_ds, tokenizer, seq_len: int):
-    """Pack {"text", "domain_id"} records into fixed-length input_ids + domain_ids.
+def iter_packed_domain_rows(raw_ds, tokenizer, seq_len: int):
+    """Yield {"input_ids", "labels", "domain_ids"} rows. No `datasets` dependency.
 
-    Module-level and dependency-light on purpose: this is the piece that decides which
-    token gets supervised as which domain, and if it is wrong nothing downstream can
-    tell -- the loss curve stays perfectly plausible while the gate trains toward a
-    mislabelled target. It needs to be unit-testable without a GPU, a trainer, or a real
-    tokenizer, so the packing itself lives in mlambaformer.packing (which takes a plain
-    encode callable) and this function only adapts a HF dataset to it.
+    This is the piece that decides which token gets supervised as which domain, and if it
+    is wrong nothing downstream can tell -- the loss curve stays perfectly plausible while
+    the gate trains toward a mislabelled target. So it must be testable, and on 2026-08-04
+    it was not: the only environments that can import BOTH `datasets` and `mlambaformer`
+    are a 40 GB image that is not built on this box, so the test for it could not run
+    anywhere. A test that cannot run is not a test.
+
+    Splitting the pure logic out fixes that -- it needs only an object exposing
+    `column_names`, `__len__` and iteration, which a plain list-backed stub satisfies.
+    `Dataset.from_generator` stays in the thin wrapper below, where there is nothing left
+    to get wrong.
     """
-    from datasets import Dataset
-
     from mlambaformer.packing import pack_domain_documents
 
     cols = set(raw_ds.column_names)
@@ -84,19 +87,23 @@ def _pack_with_domains(raw_ds, tokenizer, seq_len: int):
             "bytes/token) and set `shards_dir` in the run config."
         )
 
-    def _gen():
-        docs = ((r["text"], int(r["domain_id"])) for r in raw_ds)
-        for win in pack_domain_documents(docs, _encode, seq_len, eos_id=eos_id):
-            # labels == input_ids: the model shifts internally for CLM. domain_ids is
-            # NOT shifted -- domain is a property of the token at position s and the gate
-            # reads position s's hidden state (modeling_mlambaformer.py:643-645).
-            yield {
-                "input_ids": win["input_ids"],
-                "labels": list(win["input_ids"]),
-                "domain_ids": win["domain_ids"],
-            }
+    docs = ((r["text"], int(r["domain_id"])) for r in raw_ds)
+    for win in pack_domain_documents(docs, _encode, seq_len, eos_id=eos_id):
+        # labels == input_ids: the model shifts internally for CLM. domain_ids is NOT
+        # shifted -- domain is a property of the token at position s and the gate reads
+        # position s's hidden state (modeling_mlambaformer.py:643-645).
+        yield {
+            "input_ids": win["input_ids"],
+            "labels": list(win["input_ids"]),
+            "domain_ids": win["domain_ids"],
+        }
 
-    return Dataset.from_generator(_gen)
+
+def _pack_with_domains(raw_ds, tokenizer, seq_len: int):
+    """Materialise iter_packed_domain_rows into a HF Dataset. Thin on purpose."""
+    from datasets import Dataset
+
+    return Dataset.from_generator(lambda: iter_packed_domain_rows(raw_ds, tokenizer, seq_len))
 
 
 def main() -> None:
