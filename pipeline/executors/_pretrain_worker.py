@@ -183,6 +183,34 @@ def main() -> None:
     param_count = sum(p.numel() for p in model.parameters())
     _emit("corpus_loaded", {"param_count": param_count})
 
+    # ── Regional torch.compile (R13) ──────────────────────────────────────────
+    # PER-LAYER, not whole-model. This distinction is measured, not stylistic:
+    #   whole-model (HF Trainer's torch_compile=true)  0.997x -- and it never actually
+    #       compiled; Dynamo skipped the model forward after create_block_mask broke the
+    #       graph, so it paid the compile wall and got nothing. That is why the run config
+    #       sets torch_compile: false and must keep doing so.
+    #   per-layer (this)                                1.143x measured 2026-08-04, from
+    #       8,117,090 -> 7,101,345 us/step. It eats 84% of the ELEMENTWISE kernel class.
+    # Until now this existed ONLY as a loop inside scripts/bench_train_step.py, so every
+    # measured 1.143x lived in the benchmark and no training run ever saw it (R13).
+    #
+    # FAILS LOUD IF IT CANNOT FIND THE LAYERS. A silently-skipped optimisation is the exact
+    # mechanism that kept this gap open for twelve days -- the config asks for it, nothing
+    # happens, and the throughput shortfall looks like the model rather than the wiring.
+    if bool(train_cfg.get("regional_compile", False)):
+        import torch
+
+        layers = getattr(getattr(model, "model", None), "layers", None)
+        if layers is None:
+            raise RuntimeError(
+                f"regional_compile=true but {model_type!r} exposes no model.model.layers to "
+                "compile. Refusing to continue silently: the run asked for the 1.143x and "
+                "would otherwise have paid nothing and reported it as achieved."
+            )
+        for i in range(len(layers)):
+            layers[i] = torch.compile(layers[i], dynamic=False)
+        _emit("regional_compile", {"layers_compiled": len(layers)})
+
     # ── Datasets ──────────────────────────────────────────────────────────────
     train_path = run_datasets_dir / "train.jsonl"
     if not train_path.exists():
@@ -299,6 +327,25 @@ def main() -> None:
         save_steps=int(train_cfg.get("save_steps", 100)),
         logging_steps=int(train_cfg.get("logging_steps", 10)),
         report_to="none",
+        # R13 (2026-08-06): these four were DECLARED in the run config and read NOWHERE.
+        # configs/run/mad160-v1.json has set optim, seed and data_seed since it was written,
+        # and none of them reached TrainingArguments -- so the run silently used HF's
+        # defaults (adamw_torch, seed 42) while the config of record said otherwise. A
+        # config key with no consumer is indistinguishable from a config key that works,
+        # right up until you compare the run against what you thought you asked for.
+        #   optim      -- the optimizer is a NUMERICS decision, not just a throughput one:
+        #                 fp32 Adam m+v is 6.94 GiB at 932.02M params vs 1.74 GiB for a
+        #                 low-bit state, and that 5.21 GiB is what OOM'd four benchmarks
+        #                 on 2026-08-06. Defaulted to adamw_torch_fused, which is what the
+        #                 run config asks for.
+        #   seed/data_seed -- a 50B-token run that cannot be reproduced is not a result.
+        optim=train_cfg.get("optim", "adamw_torch_fused"),
+        seed=int(train_cfg.get("seed", 42)),
+        data_seed=int(train_cfg.get("data_seed", train_cfg.get("seed", 42))),
+        # Whole-model compile, measured 0.997x and it never actually compiled -- see the
+        # regional_compile block above for the mechanism that is worth 1.143x. Wired only so
+        # the key is not silently dead; it should stay false.
+        torch_compile=bool(train_cfg.get("torch_compile", False)),
         max_seq_length=int(cfg.get("max_seq_length", 2048)),
         deepspeed=ds_config,
     )
